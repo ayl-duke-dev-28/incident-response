@@ -13,15 +13,15 @@ def _runbook(body: str) -> Runbook:
 
 
 def test_parse_steps_reads_json_block():
-    body = """
-    ## Automated actions
-    ```json
-    [
-      {"name": "rollback", "command": "deploy rollback checkout", "auto": true},
-      {"name": "flip flag", "command": "feature-flag set x off"}
-    ]
-    ```
-    """
+    body = (
+        "## Automated actions\n"
+        "```json\n"
+        "[\n"
+        '  {"name": "rollback", "command": "deploy rollback checkout", "auto": true},\n'
+        '  {"name": "flip flag", "command": "feature-flag set x off"}\n'
+        "]\n"
+        "```\n"
+    )
     steps = parse_steps(_runbook(body))
     assert len(steps) == 2
     assert steps[0].name == "rollback"
@@ -34,7 +34,7 @@ def test_parse_steps_returns_empty_when_absent():
 
 
 def test_parse_steps_tolerates_bad_json():
-    body = "## Automated actions\n```json\n{not json}\n```"
+    body = "## Automated actions\n```json\n{not json}\n```\n"
     assert parse_steps(_runbook(body)) == []
 
 
