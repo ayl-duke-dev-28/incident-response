@@ -15,8 +15,9 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_repo: str = "owner/repo"
 
-    slack_mode: str = "mock"
+    slack_mode: str = "mock"  # "mock" | "webhook" | "bot"
     slack_webhook_url: str = ""
+    slack_bot_token: str = ""
     slack_channel: str = "#incidents"
 
     metrics_mode: str = "mock"
@@ -45,6 +46,11 @@ class Settings(BaseSettings):
     remediation_mode: str = "mock"  # "mock" | "shell"
     remediation_allowed_commands: str = "feature-flag,kubectl,deploy"  # comma-separated
     remediation_timeout_seconds: float = 30.0
+
+    # Verification loop
+    verification_enabled: bool = True
+    verification_total_minutes: int = 10
+    verification_poll_seconds: int = 30
 
     # Observability
     log_level: str = "INFO"

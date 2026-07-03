@@ -7,14 +7,18 @@ from .llm import LLM
 
 SYSTEM_PROMPT = """You are a staff SRE performing incident triage.
 
-Given a production alert and a list of recent commits, identify which commits are most
-likely responsible. Consider:
+Given a production alert, a list of recent commits, and (when available) similar
+past incidents, identify which commits are most likely responsible. Consider:
 - Timing (commits deployed near the alert time are more suspect)
 - Files touched (matching the alerting service or subsystem)
 - Commit message signal (perf, refactor, dependency bumps, feature flags)
 - Size (large diffs = higher risk)
+- Prior incidents on this service with similar symptoms — if a past root cause
+  matches (e.g. "Redis maxmemory eviction"), commits touching that area are
+  much more suspect.
 
 Rank up to 3 suspects. For each: sha, confidence (0.0-1.0), and one-sentence reasoning.
+When a past incident is highly relevant, mention it briefly in the reasoning.
 """
 
 
@@ -30,10 +34,16 @@ def _format_commits(commits: list[Commit]) -> str:
 
 
 async def identify_suspects(
-    llm: LLM, alert: Alert, commits: list[Commit], max_suspects: int = 3
+    llm: LLM,
+    alert: Alert,
+    commits: list[Commit],
+    max_suspects: int = 3,
+    history_context: str = "",
 ) -> list[SuspectCommit]:
     if not commits:
         return []
+
+    history_block = f"\n{history_context}\n" if history_context else ""
 
     user = (
         f"Alert: {alert.title}\n"
@@ -41,7 +51,8 @@ async def identify_suspects(
         f"Severity: {alert.severity.value}\n"
         f"Triggered: {alert.triggered_at.isoformat()}\n"
         f"Metric: {alert.metric} value={alert.value} threshold={alert.threshold}\n"
-        f"Description: {alert.description}\n\n"
+        f"Description: {alert.description}\n"
+        f"{history_block}\n"
         f"Recent commits (newest first):\n{_format_commits(commits)}\n\n"
         f'Return JSON: {{"suspects": [{{"sha": "...", "confidence": 0.0, "reasoning": "..."}}]}}'
     )

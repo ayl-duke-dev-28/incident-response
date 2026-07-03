@@ -57,7 +57,9 @@ def build_orchestrator(settings: Settings, llm: LLM | None = None) -> IncidentOr
         llm = AnthropicLLM(api_key=settings.anthropic_api_key, model=settings.anthropic_model)
 
     github = build_github_client(settings.github_mode, settings.github_token, settings.github_repo)
-    slack = build_slack_client(settings.slack_mode, settings.slack_webhook_url)
+    slack = build_slack_client(
+        settings.slack_mode, settings.slack_webhook_url, settings.slack_bot_token
+    )
     metrics = build_metrics_client(
         settings.metrics_mode, settings.datadog_api_key, settings.datadog_app_key
     )
@@ -70,6 +72,9 @@ def build_orchestrator(settings: Settings, llm: LLM | None = None) -> IncidentOr
         runbooks_dir=settings.runbooks_dir,
         postmortem_dir=settings.postmortem_dir,
         dedup_bucket_minutes=settings.dedup_bucket_minutes,
+        verification_enabled=settings.verification_enabled,
+        verification_total_minutes=settings.verification_total_minutes,
+        verification_poll_seconds=settings.verification_poll_seconds,
     )
     return IncidentOrchestrator(
         llm=llm,

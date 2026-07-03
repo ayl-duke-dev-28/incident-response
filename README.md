@@ -85,7 +85,7 @@ Flip mode env vars in `.env`:
 | Env var | Modes | Notes |
 |---|---|---|
 | `GITHUB_MODE` | `mock`, `rest` | `rest` needs `GITHUB_TOKEN` + `GITHUB_REPO` |
-| `SLACK_MODE` | `mock`, `webhook` | `webhook` needs `SLACK_WEBHOOK_URL` |
+| `SLACK_MODE` | `mock`, `webhook`, `bot` | `webhook` needs `SLACK_WEBHOOK_URL`; `bot` needs `SLACK_BOT_TOKEN` and enables streaming brief updates via `chat.update` |
 | `METRICS_MODE` | `mock`, `datadog` | `datadog` needs `DATADOG_API_KEY` + `DATADOG_APP_KEY` |
 | `REMEDIATION_MODE` | `mock`, `shell` | `shell` runs only steps in `REMEDIATION_ALLOWED_COMMANDS` with `auto: true` |
 
@@ -131,6 +131,9 @@ tags: [checkout, http_5xx]
 | Async worker (fast 202) | `queue.py` — `asyncio.Queue` + worker started/stopped via FastAPI lifespan |
 | Alert deduplication | `dedup.py` — bounded LRU with TTL, fingerprint per `(service, metric, severity, bucket)` |
 | Runbook remediation | `executor.py` — dry-run by default, `ShellExecutor` allow-list opt-in |
+| Historical post-mortem RAG for triage | `history.py` — service + keyword + recency scoring, injected as few-shot into the triage prompt |
+| Streaming Slack brief updates | `agents/brief.py::compose_streaming_brief` + `_stream_triage` — initial placeholder, then `chat.update` as each agent finishes (bot-token mode only) |
+| Post-remediation verification loop | `verification.py` — polls error rate after auto-execution, posts recovered / improving / still-elevated to the incident thread |
 
 ## Tests
 
@@ -138,7 +141,7 @@ tags: [checkout, http_5xx]
 pytest
 ```
 
-**56 tests, no network required.** Uses `FakeLLM` and mock adapters throughout.
+**75 tests, no network required.** Uses `FakeLLM` and mock adapters throughout.
 
 ## Layout
 
@@ -158,6 +161,8 @@ src/incident_response/
   dedup.py             Fingerprinting + bounded TTL LRU
   queue.py             In-process async worker
   executor.py          Runbook remediation (mock + allow-listed shell)
+  history.py           Post-mortem RAG (keyword + service + recency scoring)
+  verification.py      Post-remediation recovery loop
   agents/
     llm.py             Anthropic wrapper (retried) + FakeLLM for tests
     triage.py          Suspect-commit ranking

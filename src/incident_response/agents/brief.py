@@ -6,7 +6,7 @@ in the first 30 seconds of a page.
 
 from __future__ import annotations
 
-from ..models import Incident, TriageReport
+from ..models import Alert, ImpactEstimate, Incident, RunbookMatch, SuspectCommit, TriageReport
 
 
 def compose_slack_brief(incident: Incident, triage: TriageReport) -> str:
@@ -47,4 +47,67 @@ def compose_slack_brief(incident: Incident, triage: TriageReport) -> str:
 
     lines.append("")
     lines.append(f"*Summary:* {triage.summary}")
+    return "\n".join(lines)
+
+
+def compose_streaming_brief(
+    alert: Alert,
+    *,
+    suspects: list[SuspectCommit] | None = None,
+    runbook: RunbookMatch | None = None,
+    impact: ImpactEstimate | None = None,
+    complete: bool = False,
+) -> str:
+    """Render a brief that shows partial progress as agents complete.
+
+    Fields default to ':hourglass_flowing_sand: investigating…' when the
+    corresponding agent hasn't returned yet, letting the caller edit the
+    same Slack message in place as more information arrives.
+    """
+
+    header_icon = ":white_check_mark:" if complete else ":rotating_light:"
+    lines = [
+        f"{header_icon} *{alert.severity.value.upper()} — {alert.title}*",
+        f"*Service:* `{alert.service}`  •  *Alert ID:* `{alert.id}`  •  "
+        f"*Triggered:* {alert.triggered_at.isoformat(timespec='seconds')}",
+        "",
+    ]
+
+    if impact is not None:
+        lines.append(
+            f"*Impact:* ~{impact.affected_users:,} users affected "
+            f"({impact.affected_percent:.1f}% of active) — "
+            f"error rate {impact.error_rate * 100:.1f}%"
+        )
+        lines.append(f"_{impact.reasoning}_")
+    else:
+        lines.append("*Impact:* :hourglass_flowing_sand: estimating…")
+    lines.append("")
+
+    if suspects is None:
+        lines.append("*Likely bad commits:* :hourglass_flowing_sand: investigating…")
+    elif suspects:
+        lines.append("*Likely bad commits:*")
+        for s in suspects[:3]:
+            pr = f" (PR #{s.commit.pr_number})" if s.commit.pr_number else ""
+            lines.append(
+                f"  • `{s.commit.sha[:8]}` by {s.commit.author}{pr} — "
+                f"conf {s.confidence:.0%} — {s.commit.message.splitlines()[0]}"
+            )
+            lines.append(f"    _{s.reasoning}_")
+    else:
+        lines.append("*Likely bad commits:* none identified in recent window.")
+    lines.append("")
+
+    if runbook is None and not complete:
+        lines.append("*Runbook:* :hourglass_flowing_sand: searching…")
+    elif runbook is not None:
+        rb = runbook.runbook
+        lines.append(
+            f"*Runbook:* <{rb.path}|{rb.title}> "
+            f"(match {runbook.confidence:.0%}) — _{runbook.reasoning}_"
+        )
+    else:
+        lines.append("*Runbook:* no strong match — paging on-call for manual triage.")
+
     return "\n".join(lines)

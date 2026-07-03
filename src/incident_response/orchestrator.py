@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .agents.brief import compose_slack_brief
+from .agents.brief import compose_slack_brief, compose_streaming_brief
 from .agents.impact import estimate_impact
 from .agents.llm import LLM
 from .agents.postmortem import generate_postmortem
@@ -27,11 +27,23 @@ from .executor import (
     format_results_for_slack,
     parse_steps,
 )
+from .history import PostmortemHistory, format_for_prompt
 from .integrations.github import GitHubClient
 from .integrations.metrics import MetricsClient
 from .integrations.slack import SlackClient
 from .logging_config import set_incident_id
-from .models import Alert, Incident, IncidentStatus, Runbook, TriageReport
+from .verification import verify_recovery
+from .models import (
+    Alert,
+    ImpactEstimate,
+    Incident,
+    IncidentStatus,
+    MetricSeries,
+    Runbook,
+    RunbookMatch,
+    SuspectCommit,
+    TriageReport,
+)
 from .runbooks_loader import load_runbooks
 
 logger = logging.getLogger(__name__)
@@ -47,6 +59,9 @@ class OrchestratorConfig:
     runbooks_dir: Path
     postmortem_dir: Path
     dedup_bucket_minutes: int = 15
+    verification_enabled: bool = True
+    verification_total_minutes: int = 10
+    verification_poll_seconds: int = 30
 
 
 class IncidentOrchestrator:
@@ -71,6 +86,107 @@ class IncidentOrchestrator:
         self._dedup = dedup or DedupIndex()
         self._executor = executor or MockExecutor()
         self._runbooks: list[Runbook] = load_runbooks(config.runbooks_dir)
+        self._history = PostmortemHistory.load(config.postmortem_dir)
+
+    async def _stream_triage(
+        self,
+        alert: Alert,
+        channel: str,
+    ) -> tuple[TriageReport, str, "MetricSeries"]:
+        """Post an initial placeholder brief, then update it in place as each
+        agent finishes. Returns the final triage report and the message ts.
+        """
+
+        posted = await self._slack.post(
+            channel=channel, text=compose_streaming_brief(alert)
+        )
+        ts = posted.ts
+
+        since = alert.triggered_at - timedelta(minutes=_LOOKBACK_MINUTES)
+        commits_task = self._github.recent_commits(alert.service, since=since, limit=20)
+        error_task = self._metrics.error_rate(alert.service, minutes=_IMPACT_WINDOW_MINUTES)
+        rps_task = self._metrics.request_rate(alert.service, minutes=_IMPACT_WINDOW_MINUTES)
+        active_task = self._metrics.active_users(alert.service)
+        commits, error_series, rps_series, active = await asyncio.gather(
+            commits_task, error_task, rps_task, active_task
+        )
+
+        history_matches = self._history.search(
+            service=alert.service,
+            query=f"{alert.title} {alert.description} {alert.metric or ''}",
+        )
+        history_context = format_for_prompt(history_matches)
+        if history_matches:
+            logger.info(
+                "history_matched",
+                extra={
+                    "count": len(history_matches),
+                    "top_score": round(history_matches[0].score, 3),
+                    "top_path": history_matches[0].incident.path,
+                },
+            )
+
+        # Wrap each agent so we know which slot to fill on completion.
+        async def run_suspects() -> tuple[str, list[SuspectCommit]]:
+            return "suspects", await identify_suspects(
+                self._llm, alert, commits, history_context=history_context
+            )
+
+        async def run_runbook() -> tuple[str, RunbookMatch | None]:
+            return "runbook", await match_runbook(self._llm, alert, self._runbooks)
+
+        async def run_impact() -> tuple[str, ImpactEstimate]:
+            return "impact", await estimate_impact(
+                self._llm, error_series, rps_series, active, _IMPACT_WINDOW_MINUTES
+            )
+
+        pending = {
+            asyncio.create_task(run_suspects()),
+            asyncio.create_task(run_runbook()),
+            asyncio.create_task(run_impact()),
+        }
+        suspects: list[SuspectCommit] | None = None
+        runbook: RunbookMatch | None = None
+        impact: ImpactEstimate | None = None
+
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                slot, value = task.result()
+                if slot == "suspects":
+                    suspects = value
+                elif slot == "runbook":
+                    runbook = value
+                elif slot == "impact":
+                    impact = value
+                await self._slack.update(
+                    channel=channel,
+                    ts=ts,
+                    text=compose_streaming_brief(
+                        alert,
+                        suspects=suspects,
+                        runbook=runbook,
+                        impact=impact,
+                        complete=not pending,
+                    ),
+                )
+
+        assert suspects is not None and impact is not None
+        summary = self._summarize(alert, suspects, runbook, impact)
+        report = TriageReport(
+            suspects=suspects, runbook=runbook, impact=impact, summary=summary
+        )
+        # Final rewrite with the fully-styled brief (identical schema, includes summary line).
+        placeholder_incident = Incident(
+            id=f"inc-{alert.id}",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=alert.triggered_at,
+        )
+        await self._slack.update(
+            channel=channel, ts=ts, text=compose_slack_brief(placeholder_incident, report)
+        )
+        return report, ts, error_series
 
     async def handle_alert(self, alert: Alert) -> Incident:
         now = datetime.now(timezone.utc)
@@ -113,33 +229,21 @@ class IncidentOrchestrator:
         self._dedup.set(fingerprint, incident.id)
         logger.info("incident_opened", extra={"service": alert.service, "severity": alert.severity.value})
 
-        triage = await self._run_triage(alert)
+        triage, slack_ts, baseline_series = await self._stream_triage(
+            alert, self._config.slack_channel
+        )
         incident = incident.model_copy(
             update={
                 "triage": triage,
+                "slack_message_ts": slack_ts,
                 "timeline": incident.timeline
                 + [
                     {
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "event": f"Triage complete: {len(triage.suspects)} suspect(s), "
                         f"runbook={'yes' if triage.runbook else 'no'}, "
-                        f"impact={triage.impact.affected_users} users",
-                    }
-                ],
-            }
-        )
-        self._store.save(incident)
-
-        brief = compose_slack_brief(incident, triage)
-        posted = await self._slack.post(channel=self._config.slack_channel, text=brief)
-        incident = incident.model_copy(
-            update={
-                "slack_message_ts": posted.ts,
-                "timeline": incident.timeline
-                + [
-                    {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "event": f"Slack brief posted to {posted.channel} (ts={posted.ts})",
+                        f"impact={triage.impact.affected_users} users; "
+                        f"streamed to Slack (ts={slack_ts})",
                     }
                 ],
             }
@@ -147,7 +251,9 @@ class IncidentOrchestrator:
         self._store.save(incident)
 
         if triage.runbook:
-            remediation_summary = await self._run_remediation(triage.runbook.runbook, posted.ts)
+            remediation_summary, executed_any = await self._run_remediation(
+                triage.runbook.runbook, slack_ts
+            )
             if remediation_summary:
                 incident = incident.model_copy(
                     update={
@@ -161,12 +267,39 @@ class IncidentOrchestrator:
                     }
                 )
                 self._store.save(incident)
+            if executed_any and self._config.verification_enabled:
+                self._schedule_verification(alert, baseline_series, slack_ts)
         return incident
 
-    async def _run_remediation(self, runbook: Runbook, thread_ts: str) -> str:
+    def _schedule_verification(
+        self, alert: Alert, baseline_series: MetricSeries, thread_ts: str
+    ) -> None:
+        """Fire-and-forget: verify recovery in the background so it doesn't block
+        the incident response path. Failures are logged, never re-raised."""
+
+        async def _run() -> None:
+            try:
+                await verify_recovery(
+                    service=alert.service,
+                    baseline_series=baseline_series,
+                    metrics=self._metrics,
+                    slack=self._slack,
+                    channel=self._config.slack_channel,
+                    thread_ts=thread_ts,
+                    total_minutes=self._config.verification_total_minutes,
+                    poll_seconds=self._config.verification_poll_seconds,
+                )
+            except Exception:
+                logger.exception("verification_task_failed", extra={"alert_id": alert.id})
+
+        asyncio.create_task(_run(), name=f"verify-{alert.id}")
+
+    async def _run_remediation(
+        self, runbook: Runbook, thread_ts: str
+    ) -> tuple[str, bool]:
         steps = parse_steps(runbook)
         if not steps:
-            return ""
+            return "", False
         results = await self._executor.run(steps)
         text = format_results_for_slack(results)
         if text:
@@ -174,34 +307,16 @@ class IncidentOrchestrator:
                 channel=self._config.slack_channel, text=text, thread_ts=thread_ts
             )
         summary = ", ".join(f"{r.step.name}={r.status}" for r in results)
-        return f"Remediation attempted: {summary}"
+        executed_any = any(r.status == "executed" for r in results)
+        return f"Remediation attempted: {summary}", executed_any
 
-    async def _run_triage(self, alert: Alert) -> TriageReport:
-        since = alert.triggered_at - timedelta(minutes=_LOOKBACK_MINUTES)
-
-        commits_task = self._github.recent_commits(alert.service, since=since, limit=20)
-        error_task = self._metrics.error_rate(alert.service, minutes=_IMPACT_WINDOW_MINUTES)
-        rps_task = self._metrics.request_rate(alert.service, minutes=_IMPACT_WINDOW_MINUTES)
-        active_task = self._metrics.active_users(alert.service)
-
-        commits, error_series, rps_series, active = await asyncio.gather(
-            commits_task, error_task, rps_task, active_task
-        )
-
-        suspects_task = identify_suspects(self._llm, alert, commits)
-        runbook_task = match_runbook(self._llm, alert, self._runbooks)
-        impact_task = estimate_impact(
-            self._llm, error_series, rps_series, active, _IMPACT_WINDOW_MINUTES
-        )
-
-        suspects, runbook, impact = await asyncio.gather(
-            suspects_task, runbook_task, impact_task
-        )
-
-        summary = self._summarize(alert, suspects, runbook, impact)
-        return TriageReport(suspects=suspects, runbook=runbook, impact=impact, summary=summary)
-
-    def _summarize(self, alert, suspects, runbook, impact) -> str:
+    def _summarize(
+        self,
+        alert: Alert,
+        suspects: list[SuspectCommit],
+        runbook: RunbookMatch | None,
+        impact: ImpactEstimate,
+    ) -> str:
         if suspects:
             top = suspects[0]
             suspect_str = (
@@ -259,4 +374,6 @@ class IncidentOrchestrator:
         filename = f"{date_slug}-{incident.id}.md"
         path = self._config.postmortem_dir / filename
         path.write_text(markdown, encoding="utf-8")
+        # Fold the new post-mortem into the RAG index so the next incident sees it.
+        self._history.refresh()
         return path
