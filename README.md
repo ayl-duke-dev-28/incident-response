@@ -13,7 +13,8 @@ An AI system that responds to production outages the moment an alert fires. Aler
    - **Triage agent** — pulls the last 90 min of commits, asks Claude to rank up to 3 suspects by timing, files, message, and diff size, and returns confidence + reasoning per suspect.
    - **Runbook agent** — asks Claude to pick the best-matching runbook from `./runbooks/*.md` (title + tags + first body line, no full-content shipping to save tokens); returns `None` below a 0.3 confidence floor to avoid confidently-wrong matches.
    - **Impact agent** — pulls error-rate + request-rate series + active-user count, asks Claude for an integer affected-user estimate + peak error rate.
-7. **Slack brief** is composed (deterministic template, no LLM) and posted to the incidents channel.
+   - Before triage fires, `history.py` scores past post-mortems by service + keyword + recency and passes the top-K as few-shot context to the triage prompt **and** through to the brief as a "Prior similar incidents" section.
+7. **Slack brief** is composed (deterministic template, no LLM) and posted to the incidents channel. Includes a "Prior similar incidents" block with date, post-mortem link, similarity score, and root-cause snippet whenever the retriever finds hits — so on-call engineers see "we've fixed this before, here's how" without opening a wiki.
 8. **Runbook remediation** — if the matched runbook declares a `## Automated actions` JSON block, allow-listed `auto: true` steps run through the shell executor and results post as a threaded reply. Default `REMEDIATION_MODE=mock` never touches the system.
 9. **Incident state** is persisted to SQLite after every step, so a restart mid-flow doesn't lose anything.
 
@@ -131,7 +132,7 @@ tags: [checkout, http_5xx]
 | Async worker (fast 202) | `queue.py` — `asyncio.Queue` + worker started/stopped via FastAPI lifespan |
 | Alert deduplication | `dedup.py` — bounded LRU with TTL, fingerprint per `(service, metric, severity, bucket)` |
 | Runbook remediation | `executor.py` — dry-run by default, `ShellExecutor` allow-list opt-in |
-| Historical post-mortem RAG for triage | `history.py` — service + keyword + recency scoring, injected as few-shot into the triage prompt |
+| Historical post-mortem RAG for triage + brief | `history.py` — service + keyword + recency scoring; hits inform the triage prompt **and** surface in the Slack brief as a "Prior similar incidents" section with post-mortem links |
 | Streaming Slack brief updates | `agents/brief.py::compose_streaming_brief` + `_stream_triage` — initial placeholder, then `chat.update` as each agent finishes (bot-token mode only) |
 | Post-remediation verification loop | `verification.py` — polls error rate after auto-execution, posts recovered / improving / still-elevated to the incident thread |
 
@@ -141,7 +142,7 @@ tags: [checkout, http_5xx]
 pytest
 ```
 
-**75 tests, no network required.** Uses `FakeLLM` and mock adapters throughout.
+**80 tests, no network required.** Uses `FakeLLM` and mock adapters throughout.
 
 ## Layout
 
@@ -161,7 +162,7 @@ src/incident_response/
   dedup.py             Fingerprinting + bounded TTL LRU
   queue.py             In-process async worker
   executor.py          Runbook remediation (mock + allow-listed shell)
-  history.py           Post-mortem RAG (keyword + service + recency scoring)
+  history.py           Post-mortem RAG (keyword + service + recency scoring); feeds triage prompt + brief
   verification.py      Post-remediation recovery loop
   agents/
     llm.py             Anthropic wrapper (retried) + FakeLLM for tests
@@ -174,7 +175,7 @@ src/incident_response/
     github.py          Recent commits (Mock + REST, retried)
     slack.py           Post + thread (Mock + Webhook, retried)
     metrics.py         Error rate / rps / active users (Mock + Datadog, retried)
-tests/                 pytest suite (56 tests, no network)
+tests/                 pytest suite (80 tests, no network)
 runbooks/              Example markdown runbooks (checkout, redis, auth)
 postmortems/           Written at resolve time
 ```
