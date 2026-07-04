@@ -6,7 +6,35 @@ in the first 30 seconds of a page.
 
 from __future__ import annotations
 
-from ..models import Alert, ImpactEstimate, Incident, RunbookMatch, SuspectCommit, TriageReport
+from ..models import (
+    Alert,
+    ImpactEstimate,
+    Incident,
+    PriorIncident,
+    RunbookMatch,
+    SuspectCommit,
+    TriageReport,
+)
+
+_MAX_PRIORS_IN_BRIEF = 3
+_ROOT_CAUSE_SNIPPET_CHARS = 140
+
+
+def _format_prior_incidents(priors: list[PriorIncident]) -> list[str]:
+    """Render prior incidents as Slack lines. Empty list => empty output."""
+
+    if not priors:
+        return []
+    lines = ["*Prior similar incidents:*"]
+    for p in priors[:_MAX_PRIORS_IN_BRIEF]:
+        snippet = " ".join(p.root_cause.split())[:_ROOT_CAUSE_SNIPPET_CHARS]
+        if len(p.root_cause) > _ROOT_CAUSE_SNIPPET_CHARS:
+            snippet += "…"
+        lines.append(
+            f"  • {p.date} <{p.postmortem_path}|{p.title}> "
+            f"(sim {p.score:.2f}) — _{snippet}_"
+        )
+    return lines
 
 
 def compose_slack_brief(incident: Incident, triage: TriageReport) -> str:
@@ -45,6 +73,11 @@ def compose_slack_brief(incident: Incident, triage: TriageReport) -> str:
     else:
         lines.append("*Runbook:* no strong match — paging on-call for manual triage.")
 
+    prior_lines = _format_prior_incidents(triage.prior_incidents)
+    if prior_lines:
+        lines.append("")
+        lines.extend(prior_lines)
+
     lines.append("")
     lines.append(f"*Summary:* {triage.summary}")
     return "\n".join(lines)
@@ -56,6 +89,7 @@ def compose_streaming_brief(
     suspects: list[SuspectCommit] | None = None,
     runbook: RunbookMatch | None = None,
     impact: ImpactEstimate | None = None,
+    prior_incidents: list[PriorIncident] | None = None,
     complete: bool = False,
 ) -> str:
     """Render a brief that shows partial progress as agents complete.
@@ -109,5 +143,10 @@ def compose_streaming_brief(
         )
     else:
         lines.append("*Runbook:* no strong match — paging on-call for manual triage.")
+
+    prior_lines = _format_prior_incidents(prior_incidents or [])
+    if prior_lines:
+        lines.append("")
+        lines.extend(prior_lines)
 
     return "\n".join(lines)

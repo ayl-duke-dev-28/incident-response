@@ -27,7 +27,7 @@ from .executor import (
     format_results_for_slack,
     parse_steps,
 )
-from .history import PostmortemHistory, format_for_prompt
+from .history import PostmortemHistory, format_for_prompt, to_prior_incident
 from .integrations.github import GitHubClient
 from .integrations.metrics import MetricsClient
 from .integrations.slack import SlackClient
@@ -39,6 +39,7 @@ from .models import (
     Incident,
     IncidentStatus,
     MetricSeries,
+    PriorIncident,
     Runbook,
     RunbookMatch,
     SuspectCommit,
@@ -116,6 +117,9 @@ class IncidentOrchestrator:
             query=f"{alert.title} {alert.description} {alert.metric or ''}",
         )
         history_context = format_for_prompt(history_matches)
+        prior_incidents: list[PriorIncident] = [
+            to_prior_incident(m) for m in history_matches
+        ]
         if history_matches:
             logger.info(
                 "history_matched",
@@ -167,6 +171,7 @@ class IncidentOrchestrator:
                         suspects=suspects,
                         runbook=runbook,
                         impact=impact,
+                        prior_incidents=prior_incidents,
                         complete=not pending,
                     ),
                 )
@@ -174,7 +179,11 @@ class IncidentOrchestrator:
         assert suspects is not None and impact is not None
         summary = self._summarize(alert, suspects, runbook, impact)
         report = TriageReport(
-            suspects=suspects, runbook=runbook, impact=impact, summary=summary
+            suspects=suspects,
+            runbook=runbook,
+            impact=impact,
+            summary=summary,
+            prior_incidents=prior_incidents,
         )
         # Final rewrite with the fully-styled brief (identical schema, includes summary line).
         placeholder_incident = Incident(

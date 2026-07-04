@@ -89,6 +89,20 @@ class ImpactEstimate(BaseModel):
     time_window_minutes: int = 15
 
 
+class PriorIncident(BaseModel):
+    """Compact reference to a resolved past incident, surfaced in the Slack brief
+    so on-call engineers see 'we've seen this before' with the resolution path."""
+
+    model_config = {"frozen": True}
+
+    title: str
+    service: str
+    date: str  # pre-formatted ISO date (YYYY-MM-DD) for display
+    root_cause: str
+    score: float
+    postmortem_path: str
+
+
 class TriageReport(BaseModel):
     """Aggregate output of the parallel triage phase."""
 
@@ -98,6 +112,7 @@ class TriageReport(BaseModel):
     runbook: RunbookMatch | None
     impact: ImpactEstimate
     summary: str
+    prior_incidents: list[PriorIncident] = Field(default_factory=list)
 
 
 class Incident(BaseModel):

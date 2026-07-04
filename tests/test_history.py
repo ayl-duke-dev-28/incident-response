@@ -123,3 +123,24 @@ def test_format_for_prompt_is_readable():
     assert "Redis" in text
     assert "0.83" in text
     assert "2026-06-01" in text
+
+
+def test_to_prior_incident_maps_fields():
+    from incident_response.history import HistoricalIncident, HistoryMatch, to_prior_incident
+
+    inc = HistoricalIncident(
+        path="postmortems/2026-06-10-inc-checkout-1.md",
+        filename="2026-06-10-inc-checkout-1.md",
+        service="checkout",
+        title="Checkout Redis outage",
+        root_cause="Redis maxmemory eviction under load; new cache TTL was too long.",
+        tokens=frozenset(),
+        written_at=datetime(2026, 6, 10, tzinfo=timezone.utc),
+    )
+    prior = to_prior_incident(HistoryMatch(incident=inc, score=0.837))
+    assert prior.title == "Checkout Redis outage"
+    assert prior.service == "checkout"
+    assert prior.date == "2026-06-10"
+    assert prior.postmortem_path == "postmortems/2026-06-10-inc-checkout-1.md"
+    assert "Redis maxmemory" in prior.root_cause
+    assert prior.score == pytest.approx(0.837, abs=0.001)

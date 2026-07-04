@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .models import PriorIncident
+
 logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
@@ -181,6 +183,20 @@ class PostmortemHistory:
         recency = math.exp(-math.log(2) * age_days / 180)
 
         return (0.55 * service_score) + (0.35 * keyword_score) + (0.10 * recency)
+
+
+def to_prior_incident(match: HistoryMatch) -> PriorIncident:
+    """Convert a retrieval hit into the display-facing PriorIncident model."""
+
+    inc = match.incident
+    return PriorIncident(
+        title=inc.title,
+        service=inc.service,
+        date=inc.written_at.strftime("%Y-%m-%d"),
+        root_cause=inc.root_cause,
+        score=match.score,
+        postmortem_path=inc.path,
+    )
 
 
 def format_for_prompt(matches: list[HistoryMatch]) -> str:

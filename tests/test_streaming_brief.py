@@ -5,6 +5,7 @@ from incident_response.models import (
     Alert,
     Commit,
     ImpactEstimate,
+    PriorIncident,
     Runbook,
     RunbookMatch,
     Severity,
@@ -68,3 +69,20 @@ def test_complete_brief_uses_checkmark_and_shows_all_fields():
     assert ":hourglass_flowing_sand:" not in text
     assert "a1b2c3d4" in text
     assert "Checkout runbook" in text
+
+
+def test_streaming_brief_renders_prior_incidents_when_present():
+    priors = [
+        PriorIncident(
+            title="Checkout Redis outage",
+            service="checkout",
+            date="2026-06-10",
+            root_cause="Redis maxmemory eviction.",
+            score=0.83,
+            postmortem_path="postmortems/2026-06-10-inc-checkout-1.md",
+        )
+    ]
+    text = compose_streaming_brief(_alert(), prior_incidents=priors)
+    assert "Prior similar incidents" in text
+    assert "Checkout Redis outage" in text
+    assert "2026-06-10" in text

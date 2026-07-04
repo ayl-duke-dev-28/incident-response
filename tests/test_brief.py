@@ -6,6 +6,7 @@ from incident_response.models import (
     ImpactEstimate,
     Incident,
     IncidentStatus,
+    PriorIncident,
     Runbook,
     RunbookMatch,
     SuspectCommit,
@@ -68,3 +69,66 @@ def test_brief_handles_no_suspects_and_no_runbook(alert):
     text = compose_slack_brief(incident, triage)
     assert "none identified" in text
     assert "no strong match" in text
+
+
+def test_brief_renders_prior_similar_incidents(alert):
+    priors = [
+        PriorIncident(
+            title="Checkout Redis outage",
+            service="checkout",
+            date="2026-06-10",
+            root_cause="Redis maxmemory eviction under load; new cache TTL was too long.",
+            score=0.83,
+            postmortem_path="postmortems/2026-06-10-inc-checkout-1.md",
+        ),
+        PriorIncident(
+            title="Checkout pricing regression",
+            service="checkout",
+            date="2026-05-22",
+            root_cause="Pricing cache invalidation lag caused stale reads.",
+            score=0.61,
+            postmortem_path="postmortems/2026-05-22-inc-checkout-3.md",
+        ),
+    ]
+    triage = _fixture_triage().model_copy(update={"prior_incidents": priors})
+    incident = Incident(
+        id="inc-1", alert=alert, status=IncidentStatus.INVESTIGATING, created_at=alert.triggered_at
+    )
+    text = compose_slack_brief(incident, triage)
+    assert "Prior similar incidents" in text
+    assert "Checkout Redis outage" in text
+    assert "2026-06-10" in text
+    assert "postmortems/2026-06-10-inc-checkout-1.md" in text
+    assert "Redis maxmemory eviction" in text
+    assert "0.83" in text
+    assert "Checkout pricing regression" in text
+
+
+def test_brief_omits_prior_incidents_section_when_empty(alert):
+    incident = Incident(
+        id="inc-1", alert=alert, status=IncidentStatus.INVESTIGATING, created_at=alert.triggered_at
+    )
+    text = compose_slack_brief(incident, _fixture_triage())
+    assert "Prior similar incidents" not in text
+
+
+def test_brief_truncates_long_root_cause_snippet(alert):
+    long_cause = "Redis eviction cascade. " * 40  # ~960 chars
+    priors = [
+        PriorIncident(
+            title="Cascade",
+            service="checkout",
+            date="2026-06-10",
+            root_cause=long_cause,
+            score=0.7,
+            postmortem_path="postmortems/x.md",
+        )
+    ]
+    triage = _fixture_triage().model_copy(update={"prior_incidents": priors})
+    incident = Incident(
+        id="inc-1", alert=alert, status=IncidentStatus.INVESTIGATING, created_at=alert.triggered_at
+    )
+    text = compose_slack_brief(incident, triage)
+    # The rendered snippet for a single prior should not exceed ~200 chars.
+    prior_section = text.split("Prior similar incidents")[1]
+    assert len(prior_section) < 400
