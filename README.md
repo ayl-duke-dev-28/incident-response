@@ -15,8 +15,9 @@ An AI system that responds to production outages the moment an alert fires. Aler
    - **Impact agent** — pulls error-rate + request-rate series + active-user count, asks Claude for an integer affected-user estimate + peak error rate.
    - Before triage fires, `history.py` scores past post-mortems by service + keyword + recency and passes the top-K as few-shot context to the triage prompt **and** through to the brief as a "Prior similar incidents" section.
 7. **Slack brief** is composed (deterministic template, no LLM) and posted to the incidents channel. Includes a "Prior similar incidents" block with date, post-mortem link, similarity score, and root-cause snippet whenever the retriever finds hits — so on-call engineers see "we've fixed this before, here's how" without opening a wiki.
-8. **Runbook remediation** — if the matched runbook declares a `## Automated actions` JSON block, allow-listed `auto: true` steps run through the shell executor and results post as a threaded reply. Default `REMEDIATION_MODE=mock` never touches the system.
-9. **Incident state** is persisted to SQLite after every step, so a restart mid-flow doesn't lose anything.
+8. **PR annotation on the suspect commit** — if the top triage suspect clears the confidence floor (default 0.75) and the commit has a `pr_number`, a comment is posted on that PR linking to the incident with the same prior-similar-incidents context. The PR author lands in the investigation with resolution history in hand. Failures here never block the incident flow.
+9. **Runbook remediation** — if the matched runbook declares a `## Automated actions` JSON block, allow-listed `auto: true` steps run through the shell executor and results post as a threaded reply. Default `REMEDIATION_MODE=mock` never touches the system.
+10. **Incident state** is persisted to SQLite after every step, so a restart mid-flow doesn't lose anything.
 
 When someone hits `POST /alerts/{id}/resolve`:
 
@@ -133,6 +134,7 @@ tags: [checkout, http_5xx]
 | Alert deduplication | `dedup.py` — bounded LRU with TTL, fingerprint per `(service, metric, severity, bucket)` |
 | Runbook remediation | `executor.py` — dry-run by default, `ShellExecutor` allow-list opt-in |
 | Historical post-mortem RAG for triage + brief | `history.py` — service + keyword + recency scoring; hits inform the triage prompt **and** surface in the Slack brief as a "Prior similar incidents" section with post-mortem links |
+| PR annotation on suspect commit | `pr_annotation.py` + `_maybe_annotate_pr` — confidence-gated (default 0.75), no-op when commit lacks a PR, and try/except-wrapped so a GitHub outage never breaks incident triage |
 | Streaming Slack brief updates | `agents/brief.py::compose_streaming_brief` + `_stream_triage` — initial placeholder, then `chat.update` as each agent finishes (bot-token mode only) |
 | Post-remediation verification loop | `verification.py` — polls error rate after auto-execution, posts recovered / improving / still-elevated to the incident thread |
 
@@ -142,7 +144,7 @@ tags: [checkout, http_5xx]
 pytest
 ```
 
-**80 tests, no network required.** Uses `FakeLLM` and mock adapters throughout.
+**87 tests, no network required.** Uses `FakeLLM` and mock adapters throughout.
 
 ## Layout
 
@@ -163,6 +165,7 @@ src/incident_response/
   queue.py             In-process async worker
   executor.py          Runbook remediation (mock + allow-listed shell)
   history.py           Post-mortem RAG (keyword + service + recency scoring); feeds triage prompt + brief
+  pr_annotation.py     Deterministic PR-comment composer for the suspect commit
   verification.py      Post-remediation recovery loop
   agents/
     llm.py             Anthropic wrapper (retried) + FakeLLM for tests
@@ -175,7 +178,7 @@ src/incident_response/
     github.py          Recent commits (Mock + REST, retried)
     slack.py           Post + thread (Mock + Webhook, retried)
     metrics.py         Error rate / rps / active users (Mock + Datadog, retried)
-tests/                 pytest suite (80 tests, no network)
+tests/                 pytest suite (87 tests, no network)
 runbooks/              Example markdown runbooks (checkout, redis, auth)
 postmortems/           Written at resolve time
 ```
@@ -186,4 +189,4 @@ postmortems/           Written at resolve time
 - **Multi-instance**: rate limiter and dedup index are in-memory. Back them with Redis for horizontal scaling.
 - **Cost control**: three Claude calls per incident (triage, runbook, impact) plus one at resolve (post-mortem). At Sonnet 4.6 pricing that's ~$0.05–0.15 per incident depending on runbook library size.
 - **Post-mortem generator failure mode**: if Claude returns malformed JSON, `agents/postmortem.py` falls back to a deterministic template instead of dropping the post-mortem entirely.
-- **What it doesn't do (yet)**: no incident merging across services, no on-call rotation lookup, no Jira/Linear ticket creation, no PR-annotation for the suspect commit. Each of those is a self-contained integration behind the existing adapter pattern.
+- **What it doesn't do (yet)**: no incident merging across services, no on-call rotation lookup, no Jira/Linear ticket creation, no human-in-the-loop remediation approval. Each of those is a self-contained integration behind the existing adapter pattern.
