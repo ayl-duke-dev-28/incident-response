@@ -32,6 +32,7 @@ from .integrations.github import GitHubClient
 from .integrations.metrics import MetricsClient
 from .integrations.slack import SlackClient
 from .logging_config import set_incident_id
+from .pr_annotation import compose_pr_annotation
 from .verification import verify_recovery
 from .models import (
     Alert,
@@ -63,6 +64,8 @@ class OrchestratorConfig:
     verification_enabled: bool = True
     verification_total_minutes: int = 10
     verification_poll_seconds: int = 30
+    pr_annotate_enabled: bool = True
+    pr_annotate_confidence_floor: float = 0.75
 
 
 class IncidentOrchestrator:
@@ -259,6 +262,8 @@ class IncidentOrchestrator:
         )
         self._store.save(incident)
 
+        await self._maybe_annotate_pr(incident, triage)
+
         if triage.runbook:
             remediation_summary, executed_any = await self._run_remediation(
                 triage.runbook.runbook, slack_ts
@@ -279,6 +284,41 @@ class IncidentOrchestrator:
             if executed_any and self._config.verification_enabled:
                 self._schedule_verification(alert, baseline_series, slack_ts)
         return incident
+
+    async def _maybe_annotate_pr(self, incident: Incident, triage: TriageReport) -> None:
+        """Post an incident-context comment on the suspect commit's PR when the
+        top suspect clears the confidence floor. Non-fatal: failures are logged
+        and swallowed so the incident flow never blocks on GitHub."""
+
+        if not self._config.pr_annotate_enabled:
+            return
+        if not triage.suspects:
+            return
+        top = triage.suspects[0]
+        if top.confidence < self._config.pr_annotate_confidence_floor:
+            return
+        pr_number = top.commit.pr_number
+        if pr_number is None:
+            return
+
+        body = compose_pr_annotation(
+            incident_id=incident.id,
+            service=incident.alert.service,
+            severity=incident.alert.severity.value,
+            suspect_commit=top.commit,
+            suspect_confidence=top.confidence,
+            suspect_reasoning=top.reasoning,
+            affected_users=triage.impact.affected_users,
+            prior_incidents=triage.prior_incidents,
+        )
+        try:
+            await self._github.annotate_pr(pr_number, body)
+            logger.info(
+                "pr_annotated",
+                extra={"pr_number": pr_number, "sha": top.commit.sha, "confidence": top.confidence},
+            )
+        except Exception:
+            logger.exception("pr_annotation_failed", extra={"pr_number": pr_number})
 
     def _schedule_verification(
         self, alert: Alert, baseline_series: MetricSeries, thread_ts: str

@@ -22,17 +22,25 @@ class GitHubClient(ABC):
     async def recent_commits(self, service: str, since: datetime, limit: int = 20) -> list[Commit]:
         ...
 
+    @abstractmethod
+    async def annotate_pr(self, pr_number: int, body: str) -> None:
+        ...
+
 
 class MockGitHubClient(GitHubClient):
     """Returns a small hand-crafted set of recent commits for local dev + tests."""
 
     def __init__(self, commits: list[Commit] | None = None) -> None:
         self._commits = commits if commits is not None else _default_fixture()
+        self.annotations: list[tuple[int, str]] = []
 
     async def recent_commits(self, service: str, since: datetime, limit: int = 20) -> list[Commit]:
         matched = [c for c in self._commits if c.timestamp >= since]
         matched.sort(key=lambda c: c.timestamp, reverse=True)
         return matched[:limit]
+
+    async def annotate_pr(self, pr_number: int, body: str) -> None:
+        self.annotations.append((pr_number, body))
 
 
 class RestGitHubClient(GitHubClient):
@@ -76,6 +84,18 @@ class RestGitHubClient(GitHubClient):
                 )
             )
         return commits
+
+    @async_retry(attempts=3, base_delay=0.5, retry_on=_RETRYABLE_HTTP)
+    async def annotate_pr(self, pr_number: int, body: str) -> None:
+        # GitHub uses the "issue comments" endpoint for PR-level comments.
+        url = f"https://api.github.com/repos/{self._repo}/issues/{pr_number}/comments"
+        headers = {
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/vnd.github+json",
+        }
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, json={"body": body}, headers=headers)
+            resp.raise_for_status()
 
 
 def _default_fixture() -> list[Commit]:
