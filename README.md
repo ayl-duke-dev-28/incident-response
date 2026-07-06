@@ -136,7 +136,7 @@ tags: [checkout, http_5xx]
 | Historical post-mortem RAG for triage + brief | `history.py` — service + keyword + recency scoring; hits inform the triage prompt **and** surface in the Slack brief as a "Prior similar incidents" section with post-mortem links |
 | PR annotation on suspect commit | `pr_annotation.py` + `_maybe_annotate_pr` — confidence-gated (default 0.75), no-op when commit lacks a PR, and try/except-wrapped so a GitHub outage never breaks incident triage |
 | Streaming Slack brief updates | `agents/brief.py::compose_streaming_brief` + `_stream_triage` — initial placeholder, then `chat.update` as each agent finishes (bot-token mode only) |
-| Post-remediation verification loop | `verification.py` — polls error rate after auto-execution, posts recovered / improving / still-elevated to the incident thread |
+| Post-remediation verification loop | `verification.py` — polls error rate after auto-execution, posts recovered / improving / still-elevated to the incident thread, and persists the outcome (status, baseline vs final peak, elapsed minutes, `runbook_slug`) onto the incident record so future retrieval can weight past runbook success |
 
 ## Tests
 
