@@ -33,7 +33,7 @@ from .integrations.metrics import MetricsClient
 from .integrations.slack import SlackClient
 from .logging_config import set_incident_id
 from .pr_annotation import compose_pr_annotation
-from .verification import verify_recovery
+from .verification import VerificationResult, verify_recovery
 from .models import (
     Alert,
     ImpactEstimate,
@@ -45,6 +45,7 @@ from .models import (
     RunbookMatch,
     SuspectCommit,
     TriageReport,
+    VerificationOutcome,
 )
 from .runbooks_loader import load_runbooks
 
@@ -282,7 +283,13 @@ class IncidentOrchestrator:
                 )
                 self._store.save(incident)
             if executed_any and self._config.verification_enabled:
-                self._schedule_verification(alert, baseline_series, slack_ts)
+                self._schedule_verification(
+                    incident.id,
+                    alert,
+                    baseline_series,
+                    slack_ts,
+                    triage.runbook.runbook.slug if triage.runbook else None,
+                )
         return incident
 
     async def _maybe_annotate_pr(self, incident: Incident, triage: TriageReport) -> None:
@@ -321,14 +328,21 @@ class IncidentOrchestrator:
             logger.exception("pr_annotation_failed", extra={"pr_number": pr_number})
 
     def _schedule_verification(
-        self, alert: Alert, baseline_series: MetricSeries, thread_ts: str
+        self,
+        incident_id: str,
+        alert: Alert,
+        baseline_series: MetricSeries,
+        thread_ts: str,
+        runbook_slug: str | None,
     ) -> None:
         """Fire-and-forget: verify recovery in the background so it doesn't block
-        the incident response path. Failures are logged, never re-raised."""
+        the incident response path. On completion the outcome is persisted onto
+        the incident record so future retrieval can weight past runbook success.
+        Failures are logged, never re-raised."""
 
         async def _run() -> None:
             try:
-                await verify_recovery(
+                result = await verify_recovery(
                     service=alert.service,
                     baseline_series=baseline_series,
                     metrics=self._metrics,
@@ -338,10 +352,33 @@ class IncidentOrchestrator:
                     total_minutes=self._config.verification_total_minutes,
                     poll_seconds=self._config.verification_poll_seconds,
                 )
+                self._persist_verification_outcome(incident_id, result, runbook_slug)
             except Exception:
                 logger.exception("verification_task_failed", extra={"alert_id": alert.id})
 
         asyncio.create_task(_run(), name=f"verify-{alert.id}")
+
+    def _persist_verification_outcome(
+        self,
+        incident_id: str,
+        result: VerificationResult,
+        runbook_slug: str | None,
+    ) -> None:
+        incident = self._store.get(incident_id)
+        if incident is None:
+            logger.warning(
+                "verification_persist_missing_incident", extra={"incident_id": incident_id}
+            )
+            return
+        outcome = VerificationOutcome(
+            status=result.status,
+            baseline_peak=result.baseline_peak,
+            final_peak=result.final_peak,
+            minutes_elapsed=result.minutes_elapsed,
+            message=result.message,
+            runbook_slug=runbook_slug,
+        )
+        self._store.save(incident.model_copy(update={"verification_outcome": outcome}))
 
     async def _run_remediation(
         self, runbook: Runbook, thread_ts: str

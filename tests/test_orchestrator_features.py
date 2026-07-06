@@ -1,16 +1,12 @@
 """Integration tests covering the three new features end-to-end."""
 
-from datetime import datetime, timezone
 from pathlib import Path
-
-import pytest
 
 from incident_response.agents.llm import FakeLLM
 from incident_response.db import IncidentStore
 from incident_response.executor import (
     MockExecutor,
     RemediationExecutor,
-    RunbookStep,
     StepResult,
 )
 from incident_response.integrations.github import MockGitHubClient
@@ -102,15 +98,25 @@ async def test_verification_scheduled_after_real_execution(alert, tmp_db, runboo
     pm_dir = tmp_path / "pm"
     pm_dir.mkdir()
     llm = FakeLLM(_triage_responses())
-    orch, slack = _build(
+    store = IncidentStore(tmp_db)
+    slack = MockSlackClient()
+    orch = IncidentOrchestrator(
         llm=llm,
-        tmp_db=tmp_db,
-        pm_dir=pm_dir,
-        runbooks_dir=runbooks_dir,
+        github=MockGitHubClient(),
+        slack=slack,
+        metrics=MockMetricsClient(),
+        store=store,
+        config=OrchestratorConfig(
+            slack_channel="#x",
+            runbooks_dir=runbooks_dir,
+            postmortem_dir=pm_dir,
+            verification_enabled=True,
+            verification_total_minutes=1,
+            verification_poll_seconds=1,
+        ),
         executor=_AlwaysExecuteExecutor(),
-        verification_enabled=True,
     )
-    await orch.handle_alert(alert)
+    incident = await orch.handle_alert(alert)
 
     # Drain the fire-and-forget verification task (poll_seconds=1, total_minutes=1)
     import asyncio
@@ -126,6 +132,22 @@ async def test_verification_scheduled_after_real_execution(alert, tmp_db, runboo
     verification_posts = [m for m in slack.sent if _is_verdict(m.text)]
     assert verification_posts, "verification should have posted a result"
     assert verification_posts[0].thread_ts == slack.sent[0].ts
+
+    # The outcome must land on the persisted incident record — not just Slack.
+    # Poll briefly for the async task to complete and write back to the store.
+    for _ in range(40):
+        persisted = store.get(incident.id)
+        if persisted and persisted.verification_outcome is not None:
+            break
+        await asyncio.sleep(0.05)
+    persisted = store.get(incident.id)
+    assert persisted is not None
+    assert persisted.verification_outcome is not None
+    assert persisted.verification_outcome.status in (
+        "recovered", "improving", "still_elevated", "no_baseline",
+    )
+    # Runbook slug is captured so future retrieval can group by "which runbook worked."
+    assert persisted.verification_outcome.runbook_slug == "checkout-error-rate"
 
 
 async def test_verification_skipped_when_no_real_execution(alert, tmp_db, runbooks_dir, tmp_path):

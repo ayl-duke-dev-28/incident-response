@@ -115,6 +115,21 @@ class TriageReport(BaseModel):
     prior_incidents: list[PriorIncident] = Field(default_factory=list)
 
 
+class VerificationOutcome(BaseModel):
+    """Persisted result of the post-remediation verification loop. Written back
+    to the incident so future retrieval can prefer past matches whose runbook
+    actually recovered the system."""
+
+    model_config = {"frozen": True}
+
+    status: str  # "recovered" | "improving" | "still_elevated" | "no_baseline"
+    baseline_peak: float
+    final_peak: float
+    minutes_elapsed: float
+    message: str
+    runbook_slug: str | None = None
+
+
 class Incident(BaseModel):
     id: str
     alert: Alert
@@ -125,6 +140,7 @@ class Incident(BaseModel):
     slack_message_ts: str | None = None
     postmortem_path: str | None = None
     timeline: list[dict[str, Any]] = Field(default_factory=list)
+    verification_outcome: VerificationOutcome | None = None
 
 
 class MetricPoint(BaseModel):
