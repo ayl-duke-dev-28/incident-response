@@ -144,3 +144,116 @@ def test_to_prior_incident_maps_fields():
     assert prior.postmortem_path == "postmortems/2026-06-10-inc-checkout-1.md"
     assert "Redis maxmemory" in prior.root_cause
     assert prior.score == pytest.approx(0.837, abs=0.001)
+
+
+def test_load_parses_runbook_slug_and_verification_status(pm_dir: Path):
+    _write_pm(
+        pm_dir,
+        "2026-06-10-inc-checkout-1.md",
+        "# Checkout outage\n\n**Service:** `checkout`\n\n"
+        "## Root Cause\nRedis maxmemory eviction.\n\n"
+        "---\n\n"
+        "**Runbook slug:** `checkout-error-rate`\n"
+        "**Verification status:** recovered\n",
+    )
+    history = PostmortemHistory.load(pm_dir)
+    inc = history.incidents[0]
+    assert inc.runbook_slug == "checkout-error-rate"
+    assert inc.verification_status == "recovered"
+
+
+def test_load_leaves_metadata_none_when_absent(pm_dir: Path):
+    """Legacy post-mortems without the metadata footer must still load cleanly."""
+
+    _write_pm(
+        pm_dir,
+        "2026-06-10-inc-checkout-1.md",
+        "# Checkout outage\n\n**Service:** `checkout`\n\n"
+        "## Root Cause\nRedis eviction.\n",
+    )
+    history = PostmortemHistory.load(pm_dir)
+    inc = history.incidents[0]
+    assert inc.runbook_slug is None
+    assert inc.verification_status is None
+
+
+def test_search_boosts_match_when_same_runbook_recovered_before(pm_dir: Path):
+    """A past incident whose runbook recovered is a much stronger signal than
+    a same-service match whose runbook is unknown or failed."""
+
+    _write_pm(
+        pm_dir,
+        "2026-06-10-inc-checkout-recovered.md",
+        "# Recovered\n\n**Service:** `checkout`\n\n"
+        "## Root Cause\nGeneric words that will not overlap.\n\n"
+        "---\n\n**Runbook slug:** `checkout-error-rate`\n"
+        "**Verification status:** recovered\n",
+    )
+    _write_pm(
+        pm_dir,
+        "2026-06-15-inc-checkout-elevated.md",
+        "# Still elevated\n\n**Service:** `checkout`\n\n"
+        "## Root Cause\nRedis eviction cache pricing regression.\n\n"
+        "---\n\n**Runbook slug:** `redis-eviction`\n"
+        "**Verification status:** still_elevated\n",
+    )
+    history = PostmortemHistory.load(pm_dir)
+
+    # Without a candidate runbook, keyword-heavy match wins.
+    unboosted = history.search(
+        service="checkout",
+        query="Redis eviction cache pricing",
+        now=datetime(2026, 7, 5, tzinfo=timezone.utc),
+    )
+    assert unboosted[0].incident.filename == "2026-06-15-inc-checkout-elevated.md"
+
+    # With the candidate runbook slug, the recovered past incident is promoted.
+    boosted = history.search(
+        service="checkout",
+        query="Redis eviction cache pricing",
+        now=datetime(2026, 7, 5, tzinfo=timezone.utc),
+        candidate_runbook_slug="checkout-error-rate",
+    )
+    assert boosted[0].incident.filename == "2026-06-10-inc-checkout-recovered.md"
+
+
+def test_search_does_not_boost_when_runbook_slug_differs(pm_dir: Path):
+    _write_pm(
+        pm_dir,
+        "2026-06-10-inc-checkout-1.md",
+        "# Recovered\n\n**Service:** `checkout`\n\n## Root Cause\nRedis.\n\n"
+        "---\n\n**Runbook slug:** `checkout-error-rate`\n"
+        "**Verification status:** recovered\n",
+    )
+    history = PostmortemHistory.load(pm_dir)
+    baseline = history.search(
+        service="checkout", query="Redis",
+        now=datetime(2026, 7, 5, tzinfo=timezone.utc),
+    )
+    other_runbook = history.search(
+        service="checkout", query="Redis",
+        now=datetime(2026, 7, 5, tzinfo=timezone.utc),
+        candidate_runbook_slug="some-other-runbook",
+    )
+    assert baseline[0].score == pytest.approx(other_runbook[0].score, abs=0.001)
+
+
+def test_search_does_not_boost_when_verification_did_not_recover(pm_dir: Path):
+    _write_pm(
+        pm_dir,
+        "2026-06-10-inc-checkout-1.md",
+        "# Still elevated\n\n**Service:** `checkout`\n\n## Root Cause\nRedis.\n\n"
+        "---\n\n**Runbook slug:** `checkout-error-rate`\n"
+        "**Verification status:** still_elevated\n",
+    )
+    history = PostmortemHistory.load(pm_dir)
+    baseline = history.search(
+        service="checkout", query="Redis",
+        now=datetime(2026, 7, 5, tzinfo=timezone.utc),
+    )
+    same_runbook_but_failed = history.search(
+        service="checkout", query="Redis",
+        now=datetime(2026, 7, 5, tzinfo=timezone.utc),
+        candidate_runbook_slug="checkout-error-rate",
+    )
+    assert baseline[0].score == pytest.approx(same_runbook_but_failed[0].score, abs=0.001)

@@ -181,6 +181,18 @@ class IncidentOrchestrator:
                 )
 
         assert suspects is not None and impact is not None
+
+        # Once the runbook is picked, re-score history with the candidate slug
+        # so past incidents this runbook has recovered before get promoted in
+        # the brief the on-call engineer actually reads.
+        if runbook is not None:
+            history_matches = self._history.search(
+                service=alert.service,
+                query=f"{alert.title} {alert.description} {alert.metric or ''}",
+                candidate_runbook_slug=runbook.runbook.slug,
+            )
+            prior_incidents = [to_prior_incident(m) for m in history_matches]
+
         summary = self._summarize(alert, suspects, runbook, impact)
         report = TriageReport(
             suspects=suspects,
@@ -459,7 +471,28 @@ class IncidentOrchestrator:
         date_slug = incident.created_at.strftime("%Y-%m-%d")
         filename = f"{date_slug}-{incident.id}.md"
         path = self._config.postmortem_dir / filename
-        path.write_text(markdown, encoding="utf-8")
+        path.write_text(self._append_metadata_footer(incident, markdown), encoding="utf-8")
         # Fold the new post-mortem into the RAG index so the next incident sees it.
         self._history.refresh()
         return path
+
+    @staticmethod
+    def _append_metadata_footer(incident: Incident, markdown: str) -> str:
+        """Add a deterministic footer with runbook slug + verification status
+        so the retriever can boost past incidents whose runbook actually
+        recovered. Legacy post-mortems without either field skip the footer."""
+
+        runbook_slug: str | None = None
+        if incident.triage and incident.triage.runbook:
+            runbook_slug = incident.triage.runbook.runbook.slug
+        outcome = incident.verification_outcome
+
+        if runbook_slug is None and outcome is None:
+            return markdown
+
+        lines = ["", "---", ""]
+        if runbook_slug:
+            lines.append(f"**Runbook slug:** `{runbook_slug}`")
+        if outcome:
+            lines.append(f"**Verification status:** {outcome.status}")
+        return markdown.rstrip() + "\n" + "\n".join(lines) + "\n"

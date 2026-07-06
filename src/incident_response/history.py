@@ -83,6 +83,20 @@ def _extract_title(content: str, filename: str) -> str:
     return Path(filename).stem
 
 
+def _extract_runbook_slug(content: str) -> str | None:
+    m = re.search(
+        r"\*\*Runbook slug:\*\*\s*`?([A-Za-z0-9_.\-]+)`?", content, re.IGNORECASE
+    )
+    return m.group(1).lower() if m else None
+
+
+def _extract_verification_status(content: str) -> str | None:
+    m = re.search(
+        r"\*\*Verification status:\*\*\s*([A-Za-z_]+)", content, re.IGNORECASE
+    )
+    return m.group(1).lower() if m else None
+
+
 @dataclass(frozen=True)
 class HistoricalIncident:
     path: str
@@ -92,6 +106,8 @@ class HistoricalIncident:
     root_cause: str
     tokens: frozenset[str]
     written_at: datetime
+    runbook_slug: str | None = None
+    verification_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -133,6 +149,8 @@ class PostmortemHistory:
                     root_cause=_extract_root_cause(text),
                     tokens=frozenset(_tokenize(text)),
                     written_at=written_at,
+                    runbook_slug=_extract_runbook_slug(text),
+                    verification_status=_extract_verification_status(text),
                 )
             )
 
@@ -144,16 +162,18 @@ class PostmortemHistory:
         now: datetime | None = None,
         top_k: int = 3,
         min_score: float = 0.15,
+        candidate_runbook_slug: str | None = None,
     ) -> list[HistoryMatch]:
         if not self.incidents:
             return []
         now = now or datetime.now(timezone.utc)
         query_tokens = _tokenize(query)
         service_key = service.lower()
+        candidate_slug = candidate_runbook_slug.lower() if candidate_runbook_slug else None
 
         matches: list[HistoryMatch] = []
         for incident in self.incidents:
-            score = self._score(incident, service_key, query_tokens, now)
+            score = self._score(incident, service_key, query_tokens, now, candidate_slug)
             if score >= min_score:
                 matches.append(HistoryMatch(incident=incident, score=score))
 
@@ -166,6 +186,7 @@ class PostmortemHistory:
         service: str,
         query_tokens: set[str],
         now: datetime,
+        candidate_runbook_slug: str | None = None,
     ) -> float:
         # Service match dominates. Same service is a huge signal for triage similarity.
         service_score = 1.0 if incident.service and incident.service == service else 0.0
@@ -182,7 +203,24 @@ class PostmortemHistory:
         age_days = max(0.0, (now - incident.written_at).total_seconds() / 86400)
         recency = math.exp(-math.log(2) * age_days / 180)
 
-        return (0.55 * service_score) + (0.35 * keyword_score) + (0.10 * recency)
+        # Runbook success boost — the strongest signal we have for "trust this
+        # runbook here." Only applies when the runbook we're about to suggest
+        # actually recovered this past incident.
+        runbook_success_boost = 0.0
+        if (
+            candidate_runbook_slug is not None
+            and incident.runbook_slug is not None
+            and incident.runbook_slug == candidate_runbook_slug
+            and incident.verification_status == "recovered"
+        ):
+            runbook_success_boost = 0.20
+
+        return (
+            (0.55 * service_score)
+            + (0.35 * keyword_score)
+            + (0.10 * recency)
+            + runbook_success_boost
+        )
 
 
 def to_prior_incident(match: HistoryMatch) -> PriorIncident:
