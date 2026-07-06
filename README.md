@@ -133,10 +133,10 @@ tags: [checkout, http_5xx]
 | Async worker (fast 202) | `queue.py` — `asyncio.Queue` + worker started/stopped via FastAPI lifespan |
 | Alert deduplication | `dedup.py` — bounded LRU with TTL, fingerprint per `(service, metric, severity, bucket)` |
 | Runbook remediation | `executor.py` — dry-run by default, `ShellExecutor` allow-list opt-in |
-| Historical post-mortem RAG for triage + brief | `history.py` — service + keyword + recency scoring; hits inform the triage prompt **and** surface in the Slack brief as a "Prior similar incidents" section with post-mortem links |
+| Historical post-mortem RAG for triage + brief | `history.py` — service + keyword + recency scoring, plus a runbook-success boost that promotes past incidents whose runbook actually recovered the system (fed by the verification metadata footer in each post-mortem); hits inform the triage prompt **and** surface in the Slack brief as a "Prior similar incidents" section with post-mortem links |
 | PR annotation on suspect commit | `pr_annotation.py` + `_maybe_annotate_pr` — confidence-gated (default 0.75), no-op when commit lacks a PR, and try/except-wrapped so a GitHub outage never breaks incident triage |
 | Streaming Slack brief updates | `agents/brief.py::compose_streaming_brief` + `_stream_triage` — initial placeholder, then `chat.update` as each agent finishes (bot-token mode only) |
-| Post-remediation verification loop | `verification.py` — polls error rate after auto-execution, posts recovered / improving / still-elevated to the incident thread, and persists the outcome (status, baseline vs final peak, elapsed minutes, `runbook_slug`) onto the incident record so future retrieval can weight past runbook success |
+| Post-remediation verification loop | `verification.py` — polls error rate after auto-execution, posts recovered / improving / still-elevated to the incident thread, and persists the outcome (status, baseline vs final peak, elapsed minutes, `runbook_slug`) onto the incident record. `_write_postmortem` embeds these as a metadata footer in the generated markdown, which `history.py` then reads to boost future retrieval — the compound loop that gets sharper every incident |
 
 ## Tests
 
@@ -144,7 +144,7 @@ tags: [checkout, http_5xx]
 pytest
 ```
 
-**87 tests, no network required.** Uses `FakeLLM` and mock adapters throughout.
+**92 tests, no network required.** Uses `FakeLLM` and mock adapters throughout.
 
 ## Layout
 
@@ -164,7 +164,7 @@ src/incident_response/
   dedup.py             Fingerprinting + bounded TTL LRU
   queue.py             In-process async worker
   executor.py          Runbook remediation (mock + allow-listed shell)
-  history.py           Post-mortem RAG (keyword + service + recency scoring); feeds triage prompt + brief
+  history.py           Post-mortem RAG (keyword + service + recency scoring + runbook-success boost); feeds triage prompt + brief
   pr_annotation.py     Deterministic PR-comment composer for the suspect commit
   verification.py      Post-remediation recovery loop
   agents/
@@ -178,7 +178,7 @@ src/incident_response/
     github.py          Recent commits (Mock + REST, retried)
     slack.py           Post + thread (Mock + Webhook, retried)
     metrics.py         Error rate / rps / active users (Mock + Datadog, retried)
-tests/                 pytest suite (87 tests, no network)
+tests/                 pytest suite (92 tests, no network)
 runbooks/              Example markdown runbooks (checkout, redis, auth)
 postmortems/           Written at resolve time
 ```
