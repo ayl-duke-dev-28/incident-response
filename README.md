@@ -41,8 +41,25 @@ External calls (Anthropic, GitHub REST, Slack webhook, Datadog) are wrapped in e
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"           # or ".[dev,otel]" for OpenTelemetry export
-cp .env.example .env              # set ANTHROPIC_API_KEY at minimum
-uvicorn incident_response.main:create_app --factory --reload --port 8080
+```
+
+Run the full offline demo first. It uses mock GitHub, Slack, metrics, and LLM
+adapters, so you do not need an Anthropic key or any external services:
+
+```bash
+incident-response demo
+# accepted inc-demo-checkout-001
+# triaged checkout-error-rate suspect=a1b2c3d
+# fetched inc-demo-checkout-001 status=investigating
+# resolved inc-demo-checkout-001
+# postmortem demo-postmortems/YYYY-MM-DD-inc-demo-checkout-001.md
+```
+
+Run the API locally in mock mode:
+
+```bash
+cp .env.example .env
+LLM_MODE=mock incident-response serve --reload --port 8080
 ```
 
 Fire a test alert:
@@ -79,6 +96,8 @@ curl -X POST http://localhost:8080/alerts/inc-ddg-9273/resolve \
 ```
 
 Post-mortem lands at `./postmortems/YYYY-MM-DD-inc-ddg-9273.md`.
+
+To use a real LLM, set `LLM_MODE=anthropic` and `ANTHROPIC_API_KEY` in `.env`.
 
 ## Wiring to real systems
 

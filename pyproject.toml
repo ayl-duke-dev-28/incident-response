@@ -29,7 +29,7 @@ otel = [
 ]
 
 [project.scripts]
-incident-response = "incident_response.main:run"
+incident-response = "incident_response.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

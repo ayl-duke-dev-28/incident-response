@@ -60,6 +60,57 @@ class FakeLLM(LLM):
         return self._responses.pop(0)
 
 
+class DemoLLM(LLM):
+    """Deterministic local LLM for demos and offline development."""
+
+    async def json(
+        self, *, system: str, user: str, max_tokens: int = 1024
+    ) -> dict[str, Any]:
+        if "staff SRE performing incident triage" in system:
+            return {
+                "suspects": [
+                    {
+                        "sha": "a1b2c3d",
+                        "confidence": 0.87,
+                        "reasoning": (
+                            "The checkout pricing-cache change landed minutes before "
+                            "the 5xx spike and touched the affected service."
+                        ),
+                    }
+                ]
+            }
+        if "choose the single runbook" in system:
+            slug = "checkout-error-rate" if "checkout" in user.lower() else ""
+            return {
+                "slug": slug,
+                "confidence": 0.91 if slug else 0.0,
+                "reasoning": "The alert service and error-rate metric match this runbook.",
+            }
+        if "estimate user impact" in system:
+            return {
+                "affected_users": 2282,
+                "affected_percent": 18.4,
+                "error_rate": 0.184,
+                "reasoning": "Mock metrics show a tail spike at 18.4% across 12,400 active users.",
+            }
+        if "blameless post-mortem" in system:
+            return {
+                "markdown": (
+                    "# Post-Mortem\n\n"
+                    "## Summary\n"
+                    "Checkout saw elevated 5xxs after the pricing-cache rollout. "
+                    "The demo rollback completed and the incident was resolved.\n\n"
+                    "## Impact\n"
+                    "Roughly 2,282 active users were affected at peak.\n\n"
+                    "## Action Items\n"
+                    "- [ ] Add a canary for pricing-cache error rate (P1)\n"
+                    "- [ ] Add rollback verification to the checkout runbook (P1)\n"
+                    "- [ ] Review cache fallback behavior before the next rollout (P2)\n"
+                )
+            }
+        return {}
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
     try:

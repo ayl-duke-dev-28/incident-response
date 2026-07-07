@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from incident_response.dedup import DedupIndex, alert_fingerprint
 from incident_response.models import Alert, Severity

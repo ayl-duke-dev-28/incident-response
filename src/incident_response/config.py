@@ -10,6 +10,7 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-4-6"
+    llm_mode: str = "anthropic"  # "anthropic" | "mock"
 
     github_mode: str = "mock"
     github_token: str = ""

@@ -15,10 +15,10 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from pydantic import BaseModel
 
-from .agents.llm import AnthropicLLM, LLM
+from .agents.llm import AnthropicLLM, DemoLLM, LLM
 from .config import Settings, load_settings
 from .db import IncidentStore
 from .dedup import DedupIndex
@@ -50,9 +50,17 @@ def build_executor(settings: Settings) -> RemediationExecutor:
 
 def build_orchestrator(settings: Settings, llm: LLM | None = None) -> IncidentOrchestrator:
     if llm is None:
+        if settings.llm_mode == "mock":
+            llm = DemoLLM()
+        elif settings.llm_mode != "anthropic":
+            raise RuntimeError(
+                f"Unsupported LLM_MODE={settings.llm_mode!r}. Use 'anthropic' or 'mock'."
+            )
+    if llm is None:
         if not settings.anthropic_api_key:
             raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set. Set it in .env or inject a FakeLLM for tests."
+                "ANTHROPIC_API_KEY is not set. Set it in .env, set LLM_MODE=mock "
+                "for an offline demo, or inject an LLM for tests."
             )
         llm = AnthropicLLM(api_key=settings.anthropic_api_key, model=settings.anthropic_model)
 
@@ -225,9 +233,9 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
 
 
 def run() -> None:
-    import uvicorn
+    from .cli import main
 
-    uvicorn.run(create_app(), host="0.0.0.0", port=8080)
+    raise SystemExit(main())
 
 
 if __name__ == "__main__":

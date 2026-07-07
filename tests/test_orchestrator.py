@@ -1,5 +1,3 @@
-from datetime import datetime, timezone
-
 from incident_response.agents.llm import FakeLLM
 from incident_response.db import IncidentStore
 from incident_response.integrations.github import MockGitHubClient
