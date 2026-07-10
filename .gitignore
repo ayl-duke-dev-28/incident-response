@@ -1,0 +1,7 @@
+# Local planning and agent artifacts
+PLAN.md
+.gstack/
+
+# Python runtime artifacts
+__pycache__/
+*.pyc

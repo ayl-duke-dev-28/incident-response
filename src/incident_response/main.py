@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from pydantic import BaseModel
 
 from .agents.llm import AnthropicLLM, DemoLLM, LLM
@@ -27,7 +27,7 @@ from .integrations.github import build_github_client
 from .integrations.metrics import build_metrics_client
 from .integrations.slack import build_slack_client
 from .logging_config import configure_logging, set_incident_id, set_trace_id
-from .models import Alert, Incident, Severity
+from .models import Alert, Incident, IncidentStatus, Severity
 from .orchestrator import IncidentOrchestrator, OrchestratorConfig
 from .queue import AlertQueue
 from .rate_limit import SlidingWindowRateLimiter
@@ -220,6 +220,16 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
             return await orchestrator.resolve(incident_id, payload.resolution_note)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/incidents")
+    async def list_incidents(
+        incident_status: IncidentStatus | None = Query(default=None, alias="status"),
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> list[Incident]:
+        incidents = orchestrator._store.list_recent(limit=limit)
+        if incident_status is not None:
+            incidents = [incident for incident in incidents if incident.status == incident_status]
+        return incidents
 
     @app.get("/incidents/{incident_id}")
     async def get_incident(incident_id: str) -> Incident:

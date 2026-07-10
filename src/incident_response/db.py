@@ -67,3 +67,11 @@ class IncidentStore:
                 "SELECT payload FROM incidents WHERE status != 'resolved' ORDER BY created_at DESC"
             ).fetchall()
         return [Incident.model_validate(json.loads(r["payload"])) for r in rows]
+
+    def list_recent(self, limit: int = 50) -> list[Incident]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT payload FROM incidents ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [Incident.model_validate(json.loads(r["payload"])) for r in rows]
