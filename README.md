@@ -18,6 +18,7 @@ Anthropic, GitHub, Slack, and Datadog.
 - Dry-run or execute allow-listed runbook actions.
 - Verify whether remediation actually reduced the error rate.
 - Persist incident state to SQLite after every major step.
+- List recent incidents without knowing an incident ID.
 - Generate a blameless post-mortem when the incident is resolved.
 - Run a complete offline demo with no Anthropic key and no external services.
 
@@ -101,6 +102,18 @@ Fetch the incident after triage finishes:
 curl http://localhost:8080/incidents/inc-ddg-9273
 ```
 
+List recent incidents:
+
+```bash
+curl http://localhost:8080/incidents
+```
+
+Filter or limit the list:
+
+```bash
+curl "http://localhost:8080/incidents?status=investigating&limit=10"
+```
+
 Resolve it and generate a post-mortem:
 
 ```bash
@@ -142,10 +155,18 @@ Useful demo flags:
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/alerts` | Enqueue an incident. Returns `202 {status, incident_id}`. |
+| `GET` | `/incidents` | List recent incidents. Supports `status` and `limit` query params. |
 | `GET` | `/incidents/{id}` | Fetch current incident state. |
 | `POST` | `/alerts/{id}/resolve` | Mark resolved and generate a post-mortem. |
 | `GET` | `/healthz` | Liveness check. |
 | `GET` | `/readyz` | Liveness plus queue depth. |
+
+Incident list query params:
+
+| Param | Default | Notes |
+|---|---:|---|
+| `status` | none | Optional filter: `open`, `investigating`, `mitigated`, or `resolved`. |
+| `limit` | `50` | Max recent incidents to return. Must be between `1` and `200`. |
 
 Alert fields:
 
@@ -300,6 +321,10 @@ contains:
 - timeline events
 - verification outcome
 
+The API can return recent incidents with `GET /incidents`, ordered by newest
+`created_at` first. That endpoint is the read model intended for local consoles
+and operational dashboards.
+
 Generated post-mortems include a metadata footer with runbook and verification
 status when available. `history.py` reads past post-mortems and boosts matches
 where the same runbook previously recovered the system.
@@ -323,7 +348,7 @@ pytest
 Current suite:
 
 ```text
-94 passed, no network required
+97 passed, no network required
 ```
 
 Run lint:
