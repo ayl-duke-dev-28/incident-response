@@ -346,7 +346,9 @@ contains:
 
 The API can return recent incidents with `GET /incidents`, ordered by newest
 `created_at` first. That endpoint is the read model intended for local consoles
-and operational dashboards.
+and operational dashboards. `IncidentStore.list_recent()` applies any status
+filter in SQLite before applying `LIMIT`, so filtered requests do not drop older
+matching incidents from the result window.
 
 Generated post-mortems include a metadata footer with runbook and verification
 status when available. `history.py` reads past post-mortems and boosts matches
@@ -371,7 +373,7 @@ pytest
 Current suite:
 
 ```text
-97 passed, no network required
+104 passed, no network required
 ```
 
 Run lint:
