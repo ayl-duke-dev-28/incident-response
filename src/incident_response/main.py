@@ -226,10 +226,7 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
         incident_status: IncidentStatus | None = Query(default=None, alias="status"),
         limit: int = Query(default=50, ge=1, le=200),
     ) -> list[Incident]:
-        incidents = orchestrator._store.list_recent(limit=limit)
-        if incident_status is not None:
-            incidents = [incident for incident in incidents if incident.status == incident_status]
-        return incidents
+        return orchestrator._store.list_recent(limit=limit, status=incident_status)
 
     @app.get("/incidents/{incident_id}")
     async def get_incident(incident_id: str) -> Incident:

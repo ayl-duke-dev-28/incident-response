@@ -6,7 +6,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .models import Incident
+from .models import Incident, IncidentStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS incidents (
@@ -68,10 +68,23 @@ class IncidentStore:
             ).fetchall()
         return [Incident.model_validate(json.loads(r["payload"])) for r in rows]
 
-    def list_recent(self, limit: int = 50) -> list[Incident]:
+    def list_recent(
+        self, limit: int = 50, status: IncidentStatus | None = None
+    ) -> list[Incident]:
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT payload FROM incidents ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            if status is None:
+                rows = conn.execute(
+                    "SELECT payload FROM incidents ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT payload FROM incidents
+                    WHERE status = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (status.value, limit),
+                ).fetchall()
         return [Incident.model_validate(json.loads(r["payload"])) for r in rows]
