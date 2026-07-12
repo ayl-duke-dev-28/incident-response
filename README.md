@@ -168,6 +168,9 @@ Incident list query params:
 | `status` | none | Optional filter: `open`, `investigating`, `mitigated`, or `resolved`. Invalid values return `422`. |
 | `limit` | `50` | Max recent incidents to return. Must be between `1` and `200`; out-of-range values return `422`. |
 
+When both `status` and `limit` are provided, the API filters by status before
+applying the limit, so older matching incidents are still returned.
+
 `GET /incidents` returns an empty JSON array when no incidents exist. Each item is
 the same incident object returned by `GET /incidents/{id}`:
 
