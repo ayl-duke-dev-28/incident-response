@@ -56,3 +56,27 @@ def test_list_recent_orders_all_statuses_and_limits(tmp_db, alert):
 
     assert [incident.id for incident in store.list_recent()] == ["newest", "middle", "oldest"]
     assert [incident.id for incident in store.list_recent(limit=2)] == ["newest", "middle"]
+
+
+def test_list_recent_filters_status_before_limit(tmp_db, alert):
+    store = IncidentStore(tmp_db)
+    store.save(
+        Incident(
+            id="resolved-older",
+            alert=alert,
+            status=IncidentStatus.RESOLVED,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    store.save(
+        Incident(
+            id="investigating-newer",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 6, tzinfo=timezone.utc),
+        )
+    )
+
+    incidents = store.list_recent(limit=1, status=IncidentStatus.RESOLVED)
+
+    assert [incident.id for incident in incidents] == ["resolved-older"]

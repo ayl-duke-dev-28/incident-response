@@ -102,6 +102,34 @@ def test_list_incidents_filters_by_status(tmp_path, runbooks_dir, alert):
     assert [incident["id"] for incident in response.json()] == ["inc-oldest"]
 
 
+def test_list_incidents_filters_status_before_limit(tmp_path, runbooks_dir, alert):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-resolved-older",
+            alert=alert,
+            status=IncidentStatus.RESOLVED,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    store.save(
+        _incident(
+            incident_id="inc-investigating-newer",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 6, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.get("/incidents?status=resolved&limit=1")
+
+    assert response.status_code == 200
+    assert [incident["id"] for incident in response.json()] == ["inc-resolved-older"]
+
+
 def test_list_incidents_applies_limit(tmp_path, runbooks_dir, alert):
     settings = _settings(tmp_path, runbooks_dir)
     _seed_incidents(settings, alert)
@@ -115,3 +143,30 @@ def test_list_incidents_applies_limit(tmp_path, runbooks_dir, alert):
         "inc-newest",
         "inc-middle",
     ]
+
+
+def test_list_incidents_rejects_invalid_status(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir), llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.get("/incidents?status=closed")
+
+    assert response.status_code == 422
+
+
+def test_list_incidents_rejects_limit_below_minimum(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir), llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.get("/incidents?limit=0")
+
+    assert response.status_code == 422
+
+
+def test_list_incidents_rejects_limit_above_maximum(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir), llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.get("/incidents?limit=201")
+
+    assert response.status_code == 422
