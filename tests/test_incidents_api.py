@@ -46,8 +46,7 @@ def test_list_incidents_empty(tmp_path, runbooks_dir):
     assert response.json() == []
 
 
-def test_list_incidents_orders_filters_and_limits(tmp_path, runbooks_dir, alert):
-    settings = _settings(tmp_path, runbooks_dir)
+def _seed_incidents(settings: Settings, alert: Alert) -> None:
     store = IncidentStore(settings.db_path)
     store.save(
         _incident(
@@ -73,23 +72,46 @@ def test_list_incidents_orders_filters_and_limits(tmp_path, runbooks_dir, alert)
             created_at=datetime(2026, 7, 2, 21, 6, tzinfo=timezone.utc),
         )
     )
+
+
+def test_list_incidents_orders_newest_first(tmp_path, runbooks_dir, alert):
+    settings = _settings(tmp_path, runbooks_dir)
+    _seed_incidents(settings, alert)
     app = create_app(settings=settings, llm=FakeLLM([]))
 
     with TestClient(app) as client:
-        all_response = client.get("/incidents")
-        limited_response = client.get("/incidents?limit=2")
-        filtered_response = client.get("/incidents?status=resolved")
+        response = client.get("/incidents")
 
-    assert all_response.status_code == 200
-    assert [incident["id"] for incident in all_response.json()] == [
+    assert response.status_code == 200
+    assert [incident["id"] for incident in response.json()] == [
         "inc-newest",
         "inc-middle",
         "inc-oldest",
     ]
-    assert limited_response.status_code == 200
-    assert [incident["id"] for incident in limited_response.json()] == [
+
+
+def test_list_incidents_filters_by_status(tmp_path, runbooks_dir, alert):
+    settings = _settings(tmp_path, runbooks_dir)
+    _seed_incidents(settings, alert)
+    app = create_app(settings=settings, llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.get("/incidents?status=resolved")
+
+    assert response.status_code == 200
+    assert [incident["id"] for incident in response.json()] == ["inc-oldest"]
+
+
+def test_list_incidents_applies_limit(tmp_path, runbooks_dir, alert):
+    settings = _settings(tmp_path, runbooks_dir)
+    _seed_incidents(settings, alert)
+    app = create_app(settings=settings, llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.get("/incidents?limit=2")
+
+    assert response.status_code == 200
+    assert [incident["id"] for incident in response.json()] == [
         "inc-newest",
         "inc-middle",
     ]
-    assert filtered_response.status_code == 200
-    assert [incident["id"] for incident in filtered_response.json()] == ["inc-oldest"]
