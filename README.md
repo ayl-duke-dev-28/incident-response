@@ -155,7 +155,7 @@ Useful demo flags:
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/alerts` | Enqueue an incident. Returns `202 {status, incident_id}`. |
-| `GET` | `/incidents` | List recent incidents. Supports `status` and `limit` query params. |
+| `GET` | `/incidents` | List recent incidents, newest first. Supports `status` and `limit` query params. |
 | `GET` | `/incidents/{id}` | Fetch current incident state. |
 | `POST` | `/alerts/{id}/resolve` | Mark resolved and generate a post-mortem. |
 | `GET` | `/healthz` | Liveness check. |
@@ -165,8 +165,28 @@ Incident list query params:
 
 | Param | Default | Notes |
 |---|---:|---|
-| `status` | none | Optional filter: `open`, `investigating`, `mitigated`, or `resolved`. |
-| `limit` | `50` | Max recent incidents to return. Must be between `1` and `200`. |
+| `status` | none | Optional filter: `open`, `investigating`, `mitigated`, or `resolved`. Invalid values return `422`. |
+| `limit` | `50` | Max recent incidents to return. Must be between `1` and `200`; out-of-range values return `422`. |
+
+`GET /incidents` returns an empty JSON array when no incidents exist. Each item is
+the same incident object returned by `GET /incidents/{id}`:
+
+```json
+[
+  {
+    "id": "inc-ddg-9273",
+    "status": "investigating",
+    "created_at": "2026-07-02T21:05:00Z",
+    "alert": {
+      "id": "ddg-9273",
+      "title": "Checkout 5xx > 5%",
+      "service": "checkout",
+      "severity": "sev2",
+      "triggered_at": "2026-07-02T21:05:00Z"
+    }
+  }
+]
+```
 
 Alert fields:
 
