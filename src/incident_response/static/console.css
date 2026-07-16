@@ -1,0 +1,214 @@
+/* Operator console. Dense, restrained, system sans. Severity color carries
+   operational meaning only — do not reuse it decoratively. */
+
+:root {
+  --bg: #fbfbfa;
+  --surface: #ffffff;
+  --border: #e3e3e0;
+  --text: #1c1c1a;
+  --muted: #6b6b66;
+  --link: #1a5fb4;
+  --sev1: #b7202e;
+  --sev2: #c1620a;
+  --sev3: #8a6d0b;
+  --sev4: #5a6570;
+  --touch-target: 44px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+a {
+  color: var(--link);
+}
+
+.topbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  margin-right: auto;
+}
+
+.modes {
+  display: flex;
+  gap: 6px;
+}
+
+.mode {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.queue {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+button.primary {
+  min-height: var(--touch-target);
+  padding: 0 16px;
+  background: var(--text);
+  color: var(--surface);
+  border: 0;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+button.primary:hover {
+  opacity: 0.88;
+}
+
+main {
+  padding: 20px;
+}
+
+section {
+  margin-bottom: 28px;
+}
+
+section h2 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+/* Wide table must scroll inside its own container, never the page body. */
+.incidents {
+  display: block;
+  overflow-x: auto;
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.incidents th,
+.incidents td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.incidents th {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.incidents tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.incidents tbody tr:hover {
+  background: var(--bg);
+}
+
+/* Titles are the one free-text column: let them wrap instead of stretching. */
+.incidents td.title {
+  white-space: normal;
+  min-width: 240px;
+  overflow-wrap: anywhere;
+}
+
+.sev {
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 12px;
+}
+
+.sev-sev1 { color: var(--sev1); }
+.sev-sev2 { color: var(--sev2); }
+.sev-sev3 { color: var(--sev3); }
+.sev-sev4 { color: var(--sev4); }
+
+.pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.pill-open,
+.pill-investigating {
+  border-color: currentColor;
+  color: var(--sev2);
+}
+
+.pill-mitigated {
+  border-color: currentColor;
+  color: var(--sev3);
+}
+
+.pill-resolved {
+  color: var(--muted);
+}
+
+.empty {
+  max-width: 520px;
+  padding: 32px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.empty h2 {
+  margin: 0 0 8px;
+  font-size: 16px;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text);
+}
+
+.empty p {
+  margin: 0 0 20px;
+  color: var(--muted);
+}
+
+@media (max-width: 640px) {
+  .topbar {
+    align-items: flex-start;
+  }
+
+  .topbar h1 {
+    width: 100%;
+    margin-right: 0;
+  }
+
+  .modes {
+    flex-wrap: wrap;
+  }
+}

@@ -93,6 +93,11 @@ class IncidentOrchestrator:
         self._runbooks: list[Runbook] = load_runbooks(config.runbooks_dir)
         self._history = PostmortemHistory.load(config.postmortem_dir)
 
+    @property
+    def store(self) -> IncidentStore:
+        """Read access to persisted incidents for API and console routes."""
+        return self._store
+
     async def _stream_triage(
         self,
         alert: Alert,

@@ -16,10 +16,12 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .agents.llm import AnthropicLLM, DemoLLM, LLM
 from .config import Settings, load_settings
+from .console import STATIC_DIR, register_console
 from .db import IncidentStore
 from .dedup import DedupIndex
 from .executor import MockExecutor, RemediationExecutor, ShellExecutor
@@ -226,15 +228,18 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
         incident_status: IncidentStatus | None = Query(default=None, alias="status"),
         limit: int = Query(default=50, ge=1, le=200),
     ) -> list[Incident]:
-        return orchestrator._store.list_recent(limit=limit, status=incident_status)
+        return orchestrator.store.list_recent(limit=limit, status=incident_status)
 
     @app.get("/incidents/{incident_id}")
     async def get_incident(incident_id: str) -> Incident:
         set_incident_id(incident_id)
-        incident = orchestrator._store.get(incident_id)
+        incident = orchestrator.store.get(incident_id)
         if incident is None:
             raise HTTPException(status_code=404, detail="not found")
         return incident
+
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    register_console(app, orchestrator=orchestrator, queue=queue, settings=settings)
 
     return app
 
