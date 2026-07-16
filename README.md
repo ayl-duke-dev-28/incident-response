@@ -19,6 +19,7 @@ Anthropic, GitHub, Slack, and Datadog.
 - Verify whether remediation actually reduced the error rate.
 - Persist incident state to SQLite after every major step.
 - List recent incidents without knowing an incident ID.
+- Inspect open and recently resolved incidents in a local web console.
 - Generate a blameless post-mortem when the incident is resolved.
 - Run a complete offline demo with no Anthropic key and no external services.
 
@@ -125,6 +126,38 @@ curl -X POST http://localhost:8080/alerts/inc-ddg-9273/resolve \
 
 Post-mortems are written to `./postmortems/YYYY-MM-DD-inc-*.md`.
 
+## Incident Console
+
+The console is a server-rendered operator view over the same incident data the API
+returns. It needs no frontend build, no template engine, and no external assets.
+
+```bash
+LLM_MODE=mock incident-response serve --reload --port 8080
+```
+
+Open `http://localhost:8080/console`.
+
+The incident list shows severity, service, title, status, age, metric value,
+matched runbook, and top suspect confidence, with open incidents above recently
+resolved ones. With no incidents stored, the page shows an empty state instead.
+
+To see it populated, send the test alert from the section above and reload. Triage
+runs in a background worker, so the row appears as `investigating` with `—` in its
+runbook and suspect columns, then fills those in once triage finishes.
+
+What works today:
+
+| Surface | Status |
+|---|---|
+| `GET /console` incident list | Working. |
+| `GET /static/console.css` | Working. |
+| `Trigger demo incident` button | Not wired yet. The button renders but `POST /console/demo-alert` does not exist, so it returns `404`. Use `incident-response demo` or `POST /alerts` instead. |
+| Incident title links | Not wired yet. `GET /console/incidents/{id}` does not exist, so the links return `404`. Use `GET /incidents/{id}`. |
+| Resolve action | Not wired yet. Use `POST /alerts/{id}/resolve`. |
+
+The console is local-first and unauthenticated. See Current Limits before exposing
+it on anything other than localhost. `PLAN.md` tracks the remaining console work.
+
 ## CLI
 
 ```bash
@@ -160,6 +193,8 @@ Useful demo flags:
 | `POST` | `/alerts/{id}/resolve` | Mark resolved and generate a post-mortem. |
 | `GET` | `/healthz` | Liveness check. |
 | `GET` | `/readyz` | Liveness plus queue depth. |
+| `GET` | `/console` | Operator incident list. Returns HTML, not JSON. Unauthenticated. |
+| `GET` | `/static/console.css` | Console stylesheet. |
 
 Incident list query params:
 
@@ -373,7 +408,7 @@ pytest
 Current suite:
 
 ```text
-104 passed, no network required
+110 passed, no network required
 ```
 
 Run lint:
@@ -388,6 +423,7 @@ Useful smoke checks:
 incident-response --help
 incident-response demo
 LLM_MODE=mock incident-response serve --port 8080
+curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://localhost:8080/console
 ```
 
 ## Project Layout
@@ -396,6 +432,7 @@ LLM_MODE=mock incident-response serve --port 8080
 src/incident_response/
   cli.py               CLI for serve and offline demo
   main.py              FastAPI app, lifespan worker, auth, rate limit, dedup
+  console.py           Server-rendered operator console (HTML, no template engine)
   orchestrator.py      Alert -> triage -> brief -> remediate -> resolve -> post-mortem
   models.py            Pydantic domain models
   db.py                SQLite persistence
@@ -423,6 +460,8 @@ src/incident_response/
     github.py          Mock and REST GitHub clients
     slack.py           Mock, webhook, and bot-token Slack clients
     metrics.py         Mock and Datadog metrics clients
+  static/
+    console.css        Console stylesheet, served at /static
 
 tests/                 Pytest suite
 runbooks/              Example runbooks
@@ -451,3 +490,7 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 - No Jira or Linear ticket creation.
 - No human approval workflow for shell remediation.
 - No provider-specific alert normalization beyond the shared alert schema.
+- The console is local-first and has no authentication, RBAC, or approval gates. It
+  is read-only today, but it exposes full incident detail to anyone who can reach the
+  port. Bind it to localhost.
+- The console does not auto-refresh. Reload to see triage progress.
