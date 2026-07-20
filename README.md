@@ -152,7 +152,7 @@ What works today:
 | `GET /console` incident list | Working. |
 | `GET /static/console.css` | Working. |
 | `Trigger demo incident` button | Not wired yet. The button renders but `POST /console/demo-alert` does not exist, so it returns `404`. Use `incident-response demo` or `POST /alerts` instead. |
-| Incident title links | Not wired yet. `GET /console/incidents/{id}` does not exist, so the links return `404`. Use `GET /incidents/{id}`. |
+| Incident title links | Working. `GET /console/incidents/{id}` shows alert context, triage, suspects, impact, runbook match, timeline, verification, and resolution details. Unknown IDs return an HTML `404`. |
 | Resolve action | Not wired yet. Use `POST /alerts/{id}/resolve`. |
 
 The console is local-first and unauthenticated. See Current Limits before exposing
@@ -194,6 +194,7 @@ Useful demo flags:
 | `GET` | `/healthz` | Liveness check. |
 | `GET` | `/readyz` | Liveness plus queue depth. |
 | `GET` | `/console` | Operator incident list. Returns HTML, not JSON. Unauthenticated. |
+| `GET` | `/console/incidents/{id}` | Operator incident detail. Returns HTML, including an HTML `404` for unknown IDs. Unauthenticated. |
 | `GET` | `/static/console.css` | Console stylesheet. |
 
 Incident list query params:
@@ -408,7 +409,7 @@ pytest
 Current suite:
 
 ```text
-110 passed, no network required
+114 passed, no network required
 ```
 
 Run lint:
