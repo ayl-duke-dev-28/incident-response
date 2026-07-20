@@ -19,7 +19,8 @@ Anthropic, GitHub, Slack, and Datadog.
 - Verify whether remediation actually reduced the error rate.
 - Persist incident state to SQLite after every major step.
 - List recent incidents without knowing an incident ID.
-- Inspect open and recently resolved incidents in a local web console.
+- Inspect open and recently resolved incidents, including full triage and timeline
+  detail, in a local web console.
 - Generate a blameless post-mortem when the incident is resolved.
 - Run a complete offline demo with no Anthropic key and no external services.
 
@@ -145,18 +146,28 @@ To see it populated, send the test alert from the section above and reload. Tria
 runs in a background worker, so the row appears as `investigating` with `—` in its
 runbook and suspect columns, then fills those in once triage finishes.
 
+Select an incident title to open `/console/incidents/{id}`. The detail page shows:
+
+- alert description, service, metric, threshold, current value, and tags;
+- triage summary, estimated impact, matched runbook, and suspect commits;
+- the remediation and resolution timeline;
+- verification results and the generated post-mortem path when available.
+
+Incidents still being triaged render an in-progress state instead of incomplete
+sections. Unknown incident IDs return a navigable HTML `404` page.
+
 What works today:
 
 | Surface | Status |
 |---|---|
 | `GET /console` incident list | Working. |
+| `GET /console/incidents/{id}` incident detail | Working. Shows alert, triage, impact, runbook, suspect, timeline, verification, and resolution data. |
 | `GET /static/console.css` | Working. |
 | `Trigger demo incident` button | Not wired yet. The button renders but `POST /console/demo-alert` does not exist, so it returns `404`. Use `incident-response demo` or `POST /alerts` instead. |
-| Incident title links | Working. `GET /console/incidents/{id}` shows alert context, triage, suspects, impact, runbook match, timeline, verification, and resolution details. Unknown IDs return an HTML `404`. |
 | Resolve action | Not wired yet. Use `POST /alerts/{id}/resolve`. |
 
 The console is local-first and unauthenticated. See Current Limits before exposing
-it on anything other than localhost. `PLAN.md` tracks the remaining console work.
+it on anything other than localhost.
 
 ## CLI
 
@@ -425,6 +436,8 @@ incident-response --help
 incident-response demo
 LLM_MODE=mock incident-response serve --port 8080
 curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://localhost:8080/console
+curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
+  http://localhost:8080/console/incidents/inc-ddg-9273
 ```
 
 ## Project Layout
