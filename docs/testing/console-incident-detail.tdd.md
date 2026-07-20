@@ -34,9 +34,10 @@ JSON API.
 
 `.venv/bin/pytest --cov=incident_response --cov-report=term-missing -q` passed
 with 88% total coverage and 92% coverage for `console.py`. The console remains
-local-first and unauthenticated. Resolve controls and the demo-alert action are
-separate follow-up work. The coverage run emits existing SQLite `ResourceWarning`
-messages under Python 3.14; they do not fail the suite.
+local-first and unauthenticated. Resolve controls are separate follow-up work;
+the demo-alert action is covered by `console-demo-alert.tdd.md`. The coverage run
+emits existing SQLite `ResourceWarning` messages under Python 3.14; they do not
+fail the suite.
 
 ## Merge evidence
 

@@ -156,6 +156,12 @@ Select an incident title to open `/console/incidents/{id}`. The detail page show
 Incidents still being triaged render an in-progress state instead of incomplete
 sections. Unknown incident IDs return a navigable HTML `404` page.
 
+When LLM, GitHub, Slack, metrics, and remediation modes are all `mock`, select
+**Trigger demo incident** to enqueue a collision-safe checkout scenario. The
+console waits for the worker to persist the incident, then redirects to its detail
+page. The button is hidden and the endpoint returns `403` if any mode could reach
+a real integration or execute shell remediation.
+
 What works today:
 
 | Surface | Status |
@@ -163,7 +169,7 @@ What works today:
 | `GET /console` incident list | Working. |
 | `GET /console/incidents/{id}` incident detail | Working. Shows alert, triage, impact, runbook, suspect, timeline, verification, and resolution data. |
 | `GET /static/console.css` | Working. |
-| `Trigger demo incident` button | Not wired yet. The button renders but `POST /console/demo-alert` does not exist, so it returns `404`. Use `incident-response demo` or `POST /alerts` instead. |
+| `POST /console/demo-alert` demo action | Working in all-mock mode. Enqueues a unique demo incident and redirects to its detail page. Hidden and forbidden when any integration or remediation mode is not `mock`. |
 | Resolve action | Not wired yet. Use `POST /alerts/{id}/resolve`. |
 
 The console is local-first and unauthenticated. See Current Limits before exposing
@@ -206,6 +212,7 @@ Useful demo flags:
 | `GET` | `/readyz` | Liveness plus queue depth. |
 | `GET` | `/console` | Operator incident list. Returns HTML, not JSON. Unauthenticated. |
 | `GET` | `/console/incidents/{id}` | Operator incident detail. Returns HTML, including an HTML `404` for unknown IDs. Unauthenticated. |
+| `POST` | `/console/demo-alert` | Enqueue a unique checkout demo and redirect to its detail page. Available only when all integrations and remediation use `mock`. |
 | `GET` | `/static/console.css` | Console stylesheet. |
 
 Incident list query params:
@@ -420,7 +427,7 @@ pytest
 Current suite:
 
 ```text
-114 passed, no network required
+125 passed, no network required
 ```
 
 Run lint:
@@ -438,6 +445,7 @@ LLM_MODE=mock incident-response serve --port 8080
 curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://localhost:8080/console
 curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
   http://localhost:8080/console/incidents/inc-ddg-9273
+curl -i -X POST http://localhost:8080/console/demo-alert
 ```
 
 ## Project Layout
