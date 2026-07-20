@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
@@ -24,6 +25,7 @@ from incident_response.models import (
 def _settings(tmp_path: Path, runbooks_dir: Path) -> Settings:
     return Settings(
         anthropic_api_key="test",
+        llm_mode="mock",
         github_mode="mock",
         slack_mode="mock",
         metrics_mode="mock",
@@ -328,3 +330,79 @@ def test_console_incident_detail_escapes_untrusted_content(tmp_path, runbooks_di
     assert "<img src=x" not in response.text
     assert "&lt;script&gt;" in response.text
     assert "danger&amp;value" in response.text
+
+
+def test_console_demo_alert_enqueues_and_redirects_to_detail(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir))
+
+    with TestClient(app) as client:
+        response = client.post("/console/demo-alert", follow_redirects=False)
+
+        assert response.status_code == 303
+        location = response.headers["location"]
+        assert location.startswith("/console/incidents/inc-demo-checkout-")
+        detail = client.get(location)
+
+    assert detail.status_code == 200
+    assert "Checkout 5xx &gt; 5%" in detail.text
+    assert "checkout service error rate at 18%" in detail.text
+
+
+def test_console_demo_alert_uses_collision_safe_incident_ids(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir))
+
+    with TestClient(app) as client:
+        first = client.post("/console/demo-alert", follow_redirects=False)
+        second = client.post("/console/demo-alert", follow_redirects=False)
+
+    assert first.status_code == 303
+    assert second.status_code == 303
+    assert first.headers["location"] != second.headers["location"]
+
+
+def test_console_demo_alert_is_hidden_and_forbidden_outside_mock_mode(
+    tmp_path, runbooks_dir
+):
+    settings = _settings(tmp_path, runbooks_dir).model_copy(update={"github_mode": "rest"})
+    app = create_app(settings=settings)
+    app.state.queue.submit = AsyncMock()
+
+    with TestClient(app) as client:
+        console = client.get("/console")
+        response = client.post("/console/demo-alert")
+
+    assert "Trigger demo incident" not in console.text
+    assert response.status_code == 403
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Demo mode unavailable" in response.text
+    app.state.queue.submit.assert_not_awaited()
+
+
+def test_console_demo_alert_rejects_cross_site_browser_posts(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir))
+    app.state.queue.submit = AsyncMock()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/console/demo-alert",
+            headers={"sec-fetch-site": "cross-site"},
+        )
+
+    assert response.status_code == 403
+    assert "Cross-site request rejected" in response.text
+    app.state.queue.submit.assert_not_awaited()
+
+
+def test_console_demo_alert_returns_safe_html_when_queue_submit_fails(
+    tmp_path, runbooks_dir
+):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir))
+    app.state.queue.submit = AsyncMock(side_effect=RuntimeError("database password leaked"))
+
+    with TestClient(app) as client:
+        response = client.post("/console/demo-alert")
+
+    assert response.status_code == 503
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Could not queue demo incident" in response.text
+    assert "database password leaked" not in response.text
