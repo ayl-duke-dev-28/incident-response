@@ -4,19 +4,25 @@ the API exposes — no template engine, no frontend build. See PLAN.md for scope
 This console is not production-authenticated. It is intended for localhost use.
 """
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from urllib.parse import urlsplit
+from uuid import uuid4
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from .config import Settings
-from .models import Incident, IncidentStatus
+from .models import Alert, Incident, IncidentStatus, Severity
 from .orchestrator import IncidentOrchestrator
 from .queue import AlertQueue
 
 STATIC_DIR = Path(__file__).parent / "static"
+
+logger = logging.getLogger(__name__)
 
 CONSOLE_LIMIT = 50
 
@@ -34,6 +40,8 @@ _EMPTY_BODY = (
     "Trigger the demo incident to watch triage, runbook matching, "
     "impact estimation, and post-mortem generation end to end."
 )
+
+_DEMO_PERSIST_TIMEOUT_SECONDS = 1.0
 
 
 def _format_age(created_at: datetime, now: datetime) -> str:
@@ -103,7 +111,22 @@ def _render_table(incidents: list[Incident], now: datetime) -> str:
     )
 
 
-def _render_demo_button() -> str:
+def _demo_enabled(settings: Settings) -> bool:
+    return all(
+        mode == "mock"
+        for mode in (
+            settings.llm_mode,
+            settings.github_mode,
+            settings.slack_mode,
+            settings.metrics_mode,
+            settings.remediation_mode,
+        )
+    )
+
+
+def _render_demo_button(settings: Settings) -> str:
+    if not _demo_enabled(settings):
+        return ""
     return (
         '<form method="post" action="/console/demo-alert">'
         '<button type="submit" class="primary">Trigger demo incident</button>'
@@ -111,12 +134,19 @@ def _render_demo_button() -> str:
     )
 
 
-def _render_empty_state() -> str:
+def _render_empty_state(settings: Settings) -> str:
+    if not _demo_enabled(settings):
+        return (
+            '<section class="empty">'
+            "<h2>No active incidents</h2>"
+            "<p>Send an authenticated alert to populate the console.</p>"
+            "</section>"
+        )
     return (
         '<section class="empty">'
         "<h2>No active incidents</h2>"
         f"<p>{escape(_EMPTY_BODY)}</p>"
-        f"{_render_demo_button()}"
+        f"{_render_demo_button(settings)}"
         "</section>"
     )
 
@@ -157,12 +187,14 @@ def _render_console(
         "<h1>Autonomous Incident Response</h1>"
         f"{_render_environment(settings)}"
         f'<div class="queue">Queue depth <strong>{queue_depth}</strong></div>'
-        f"{_render_demo_button()}"
+        f"{_render_demo_button(settings)}"
         "</header>"
     )
 
     if not incidents:
-        return _page("Incident console", header + f"<main>{_render_empty_state()}</main>")
+        return _page(
+            "Incident console", header + f"<main>{_render_empty_state(settings)}</main>"
+        )
 
     sections = []
     if open_incidents:
@@ -349,6 +381,51 @@ def _render_not_found(incident_id: str) -> str:
     return _page("Incident not found", body)
 
 
+def _render_console_error(title: str, message: str) -> str:
+    body = (
+        f'<main class="not-found"><h1>{escape(title)}</h1>'
+        f"<p>{escape(message)}</p>"
+        '<a href="/console">← All incidents</a></main>'
+    )
+    return _page(title, body)
+
+
+def _build_demo_alert() -> Alert:
+    token = uuid4().hex
+    return Alert(
+        id=f"demo-checkout-{token}",
+        title="Checkout 5xx > 5%",
+        description="checkout service error rate at 18%",
+        service="checkout",
+        severity=Severity.SEV2,
+        triggered_at=datetime.now(timezone.utc),
+        metric=f"http.error_rate.demo-{token}",
+        threshold=0.05,
+        value=0.184,
+        tags={"env": "demo", "source": "console"},
+    )
+
+
+def _is_cross_site(request: Request) -> bool:
+    if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+        return True
+    origin = request.headers.get("origin")
+    if not origin:
+        return False
+    parsed = urlsplit(origin)
+    return (parsed.scheme, parsed.netloc) != (request.url.scheme, request.url.netloc)
+
+
+async def _wait_for_incident(orchestrator: IncidentOrchestrator, incident_id: str) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _DEMO_PERSIST_TIMEOUT_SECONDS
+    while loop.time() < deadline:
+        if orchestrator.store.get(incident_id) is not None:
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
 def register_console(
     app: FastAPI,
     *,
@@ -375,3 +452,50 @@ def register_console(
         if incident is None:
             return HTMLResponse(content=_render_not_found(incident_id), status_code=404)
         return HTMLResponse(content=_render_incident_detail(incident))
+
+    @app.post("/console/demo-alert")
+    async def console_demo_alert(request: Request) -> HTMLResponse:
+        if not _demo_enabled(settings):
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Demo mode unavailable",
+                    "The console demo is available only when every integration and "
+                    "remediation mode is set to mock.",
+                ),
+                status_code=403,
+            )
+        if _is_cross_site(request):
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Cross-site request rejected",
+                    "Open the local console directly before triggering a demo incident.",
+                ),
+                status_code=403,
+            )
+
+        alert = _build_demo_alert()
+        incident_id = f"inc-{alert.id}"
+        try:
+            await queue.submit(alert)
+        except Exception:
+            logger.exception("console_demo_alert_enqueue_failed")
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Could not queue demo incident",
+                    "The demo incident was not accepted. Check the server logs and try again.",
+                ),
+                status_code=503,
+            )
+
+        if not await _wait_for_incident(orchestrator, incident_id):
+            logger.warning(
+                "console_demo_alert_persist_timeout", extra={"incident_id": incident_id}
+            )
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Demo incident is still queued",
+                    "Return to the incident list and reload to see it when processing starts.",
+                ),
+                status_code=202,
+            )
+        return RedirectResponse(url=f"/console/incidents/{incident_id}", status_code=303)

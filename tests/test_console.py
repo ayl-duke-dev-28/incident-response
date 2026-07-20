@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from incident_response.agents.llm import FakeLLM
@@ -360,11 +361,23 @@ def test_console_demo_alert_uses_collision_safe_incident_ids(tmp_path, runbooks_
     assert first.headers["location"] != second.headers["location"]
 
 
+@pytest.mark.parametrize(
+    ("setting_name", "unsafe_value"),
+    [
+        ("llm_mode", "anthropic"),
+        ("github_mode", "rest"),
+        ("slack_mode", "webhook"),
+        ("metrics_mode", "datadog"),
+        ("remediation_mode", "shell"),
+    ],
+)
 def test_console_demo_alert_is_hidden_and_forbidden_outside_mock_mode(
-    tmp_path, runbooks_dir
+    tmp_path, runbooks_dir, setting_name, unsafe_value
 ):
-    settings = _settings(tmp_path, runbooks_dir).model_copy(update={"github_mode": "rest"})
-    app = create_app(settings=settings)
+    settings = _settings(tmp_path, runbooks_dir).model_copy(
+        update={setting_name: unsafe_value}
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
     app.state.queue.submit = AsyncMock()
 
     with TestClient(app) as client:
@@ -378,14 +391,23 @@ def test_console_demo_alert_is_hidden_and_forbidden_outside_mock_mode(
     app.state.queue.submit.assert_not_awaited()
 
 
-def test_console_demo_alert_rejects_cross_site_browser_posts(tmp_path, runbooks_dir):
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"sec-fetch-site": "cross-site"},
+        {"origin": "https://attacker.example"},
+    ],
+)
+def test_console_demo_alert_rejects_cross_site_browser_posts(
+    tmp_path, runbooks_dir, headers
+):
     app = create_app(settings=_settings(tmp_path, runbooks_dir))
     app.state.queue.submit = AsyncMock()
 
     with TestClient(app) as client:
         response = client.post(
             "/console/demo-alert",
-            headers={"sec-fetch-site": "cross-site"},
+            headers=headers,
         )
 
     assert response.status_code == 403
@@ -406,3 +428,18 @@ def test_console_demo_alert_returns_safe_html_when_queue_submit_fails(
     assert response.headers["content-type"].startswith("text/html")
     assert "Could not queue demo incident" in response.text
     assert "database password leaked" not in response.text
+
+
+def test_console_demo_alert_handles_slow_worker_without_broken_redirect(
+    tmp_path, runbooks_dir, monkeypatch
+):
+    monkeypatch.setattr("incident_response.console._DEMO_PERSIST_TIMEOUT_SECONDS", 0)
+    app = create_app(settings=_settings(tmp_path, runbooks_dir))
+    app.state.queue.submit = AsyncMock()
+
+    with TestClient(app) as client:
+        response = client.post("/console/demo-alert", follow_redirects=False)
+
+    assert response.status_code == 202
+    assert "Demo incident is still queued" in response.text
+    assert 'href="/console"' in response.text
