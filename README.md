@@ -23,6 +23,8 @@ Anthropic, GitHub, Slack, and Datadog.
   detail, in a local web console.
 - Trigger a safe, collision-free demo incident from the console when every
   integration and remediation mode is mocked.
+- Resolve triaged incidents from the all-mock console and generate their
+  post-mortems without switching to the JSON API.
 - Generate a blameless post-mortem when the incident is resolved.
 - Run a complete offline demo with no Anthropic key and no external services.
 
@@ -163,12 +165,20 @@ Select an incident title to open `/console/incidents/{id}`. The detail page show
 - verification results and the generated post-mortem path when available.
 
 Incidents still being triaged render an in-progress state instead of incomplete
-sections. Unknown incident IDs return a navigable HTML `404` page.
+sections. Once triage finishes in all-mock mode, the detail page shows a
+**Resolve incident** form. Submit an optional note of up to 500 characters to
+mark the incident resolved, generate its post-mortem, and return to the updated
+detail page. Unknown incident IDs return a navigable HTML `404` page.
 
 The demo button is shown only when LLM, GitHub, Slack, metrics, and remediation
 modes are all `mock`. It is hidden and `POST /console/demo-alert` returns `403` if
 any mode could reach a real integration or execute shell remediation. Cross-site
 browser submissions are also rejected.
+
+The resolve form has the same all-mock and same-origin restrictions. It is hidden
+until triage finishes and after the incident is resolved. In real integration
+modes, resolve incidents through the authenticated `POST /alerts/{id}/resolve`
+API instead.
 
 What works today:
 
@@ -178,7 +188,7 @@ What works today:
 | `GET /console/incidents/{id}` incident detail | Working. Shows alert, triage, impact, runbook, suspect, timeline, verification, and resolution data. |
 | `GET /static/console.css` | Working. |
 | `POST /console/demo-alert` demo action | Working in all-mock mode. Enqueues a unique demo incident and redirects to its detail page. Hidden and forbidden when any integration or remediation mode is not `mock`. |
-| Resolve action | Not wired yet. Use `POST /alerts/{id}/resolve`. |
+| `POST /console/incidents/{id}/resolve` resolve action | Working in all-mock mode after triage completes. Accepts a form-encoded resolution note, generates a post-mortem, and redirects to the resolved detail page. |
 
 The console is local-first and unauthenticated. See Current Limits before exposing
 it on anything other than localhost.
@@ -221,6 +231,7 @@ Useful demo flags:
 | `GET` | `/console` | Operator incident list. Returns HTML, not JSON. Unauthenticated. |
 | `GET` | `/console/incidents/{id}` | Operator incident detail. Returns HTML, including an HTML `404` for unknown IDs. Unauthenticated. |
 | `POST` | `/console/demo-alert` | Enqueue a unique checkout demo and redirect to its detail page. Available only when all integrations and remediation use `mock`. |
+| `POST` | `/console/incidents/{id}/resolve` | Resolve a triaged incident from the console and redirect to its detail page. Accepts form data with an optional `resolution_note` of at most 500 characters. Available only in all-mock mode. |
 | `GET` | `/static/console.css` | Console stylesheet. |
 
 Incident list query params:
@@ -435,7 +446,7 @@ pytest
 Current suite:
 
 ```text
-125 passed, no network required
+140 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -456,6 +467,9 @@ curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://localhost:8080/c
 curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
   http://localhost:8080/console/incidents/inc-ddg-9273
 curl -i -X POST http://localhost:8080/console/demo-alert
+curl -i -X POST \
+  --data-urlencode "resolution_note=rolled back the pricing cache" \
+  http://localhost:8080/console/incidents/inc-ddg-9273/resolve
 ```
 
 ## Project Layout
@@ -523,7 +537,8 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 - No human approval workflow for shell remediation.
 - No provider-specific alert normalization beyond the shared alert schema.
 - The console is local-first and has no authentication, RBAC, or approval gates. It
-  exposes full incident detail to anyone who can reach the port. Its only write
-  action creates mock-only demo incidents; resolve and remediation controls remain
-  outside the console. Bind it to localhost.
+  exposes full incident detail to anyone who can reach the port. Console writes
+  are restricted to demo creation and incident resolution in all-mock mode;
+  real-integration resolution and remediation controls remain outside the console.
+  Bind it to localhost.
 - The console does not auto-refresh. Reload to see triage progress.

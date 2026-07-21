@@ -37,8 +37,9 @@ API manually.
 with 89% total coverage and 94% coverage for `console.py`. The console is still
 local-first and unauthenticated. Mock-only mode prevents this endpoint from
 calling real integrations or shell remediation, and cross-site browser POSTs are
-rejected. Resolve controls remain separate follow-up work. Existing SQLite
-`ResourceWarning` messages under Python 3.14 do not fail the suite.
+rejected. Console resolution is covered by `console-incident-resolve.tdd.md`.
+Existing SQLite `ResourceWarning` messages under Python 3.14 do not fail the
+suite.
 
 ## Merge evidence
 
