@@ -43,7 +43,7 @@ _EMPTY_BODY = (
 
 _DEMO_PERSIST_TIMEOUT_SECONDS = 1.0
 _MAX_RESOLUTION_NOTE_CHARS = 500
-_MAX_RESOLUTION_BODY_BYTES = 4096
+_MAX_RESOLUTION_BODY_BYTES = 8192
 
 
 def _format_age(created_at: datetime, now: datetime) -> str:
