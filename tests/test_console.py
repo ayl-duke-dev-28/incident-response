@@ -31,6 +31,7 @@ def _settings(tmp_path: Path, runbooks_dir: Path) -> Settings:
         slack_mode="mock",
         metrics_mode="mock",
         runbooks_dir=runbooks_dir,
+        postmortem_dir=tmp_path / "postmortems",
         db_path=tmp_path / "incidents.db",
         webhook_token="secret",
     )
@@ -443,3 +444,256 @@ def test_console_demo_alert_handles_slow_worker_without_broken_redirect(
     assert response.status_code == 202
     assert "Demo incident is still queued" in response.text
     assert 'href="/console"' in response.text
+
+
+def test_console_incident_detail_shows_resolve_form_only_for_open_mock_incidents(
+    tmp_path, runbooks_dir, alert
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-open-resolve",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    store.save(
+        _incident(
+            incident_id="inc-already-resolved",
+            alert=alert,
+            status=IncidentStatus.RESOLVED,
+            created_at=datetime(2026, 7, 2, 21, 4, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        open_detail = client.get("/console/incidents/inc-open-resolve")
+        resolved_detail = client.get("/console/incidents/inc-already-resolved")
+
+    assert 'action="/console/incidents/inc-open-resolve/resolve"' in open_detail.text
+    assert 'name="resolution_note"' in open_detail.text
+    assert 'maxlength="500"' in open_detail.text
+    assert "Resolve incident" in open_detail.text
+    assert "Resolve incident" not in resolved_detail.text
+
+
+def test_console_resolve_updates_incident_generates_postmortem_and_redirects(
+    tmp_path, runbooks_dir, alert
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-console-resolve",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(
+        settings=settings,
+        llm=FakeLLM([{"markdown": "# Console resolution post-mortem"}]),
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/console/incidents/inc-console-resolve/resolve",
+            data={"resolution_note": "Rolled back <cache-v2>"},
+            follow_redirects=False,
+        )
+        detail = client.get(response.headers["location"])
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/console/incidents/inc-console-resolve"
+    resolved = store.get("inc-console-resolve")
+    assert resolved is not None
+    assert resolved.status == IncidentStatus.RESOLVED
+    assert resolved.resolved_at is not None
+    assert resolved.timeline[-1]["event"] == "Resolved. Rolled back <cache-v2>"
+    assert resolved.postmortem_path is not None
+    assert Path(resolved.postmortem_path).read_text(encoding="utf-8").startswith(
+        "# Console resolution post-mortem"
+    )
+    assert detail.status_code == 200
+    assert "Resolved. Rolled back &lt;cache-v2&gt;" in detail.text
+    assert "Resolve incident" not in detail.text
+
+
+def test_console_resolve_returns_html_404_for_unknown_incident(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir), llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/console/incidents/inc-missing/resolve",
+            data={"resolution_note": "not found"},
+        )
+
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Incident not found" in response.text
+
+
+def test_console_resolve_rejects_duplicate_resolution(tmp_path, runbooks_dir, alert):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-resolved-once",
+            alert=alert,
+            status=IncidentStatus.RESOLVED,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    llm = FakeLLM([])
+    app = create_app(settings=settings, llm=llm)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/console/incidents/inc-resolved-once/resolve",
+            data={"resolution_note": "resolve twice"},
+        )
+
+    assert response.status_code == 409
+    assert "Incident already resolved" in response.text
+    assert llm.calls == []
+
+
+def test_console_resolve_validates_content_type_and_note_length(
+    tmp_path, runbooks_dir, alert
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-invalid-resolution",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        wrong_type = client.post(
+            "/console/incidents/inc-invalid-resolution/resolve",
+            content=b'{"resolution_note":"json is not accepted"}',
+            headers={"content-type": "application/json"},
+        )
+        too_long = client.post(
+            "/console/incidents/inc-invalid-resolution/resolve",
+            data={"resolution_note": "x" * 501},
+        )
+
+    assert wrong_type.status_code == 415
+    assert "Expected form data" in wrong_type.text
+    assert too_long.status_code == 422
+    assert "500 characters or fewer" in too_long.text
+    assert store.get("inc-invalid-resolution").status == IncidentStatus.INVESTIGATING
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"sec-fetch-site": "cross-site"},
+        {"origin": "https://attacker.example"},
+    ],
+)
+def test_console_resolve_rejects_cross_site_browser_posts(
+    tmp_path, runbooks_dir, alert, headers
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-cross-site-resolve",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+    app.state.orchestrator.resolve = AsyncMock()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/console/incidents/inc-cross-site-resolve/resolve",
+            data={"resolution_note": "malicious"},
+            headers=headers,
+        )
+
+    assert response.status_code == 403
+    assert "Cross-site request rejected" in response.text
+    app.state.orchestrator.resolve.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("setting_name", "unsafe_value"),
+    [
+        ("llm_mode", "anthropic"),
+        ("github_mode", "rest"),
+        ("slack_mode", "webhook"),
+        ("metrics_mode", "datadog"),
+        ("remediation_mode", "shell"),
+    ],
+)
+def test_console_resolve_is_hidden_and_forbidden_outside_mock_mode(
+    tmp_path, runbooks_dir, alert, setting_name, unsafe_value
+):
+    settings = _settings(tmp_path, runbooks_dir).model_copy(
+        update={setting_name: unsafe_value}
+    )
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-real-mode-resolve",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+    app.state.orchestrator.resolve = AsyncMock()
+
+    with TestClient(app) as client:
+        detail = client.get("/console/incidents/inc-real-mode-resolve")
+        response = client.post(
+            "/console/incidents/inc-real-mode-resolve/resolve",
+            data={"resolution_note": "unsafe"},
+        )
+
+    assert "Resolve incident" not in detail.text
+    assert response.status_code == 403
+    assert "Console writes unavailable" in response.text
+    app.state.orchestrator.resolve.assert_not_awaited()
+
+
+def test_console_resolve_returns_safe_html_when_resolution_fails(
+    tmp_path, runbooks_dir, alert
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-failed-resolve",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+    app.state.orchestrator.resolve = AsyncMock(
+        side_effect=RuntimeError("secret postmortem filesystem path")
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/console/incidents/inc-failed-resolve/resolve",
+            data={"resolution_note": "safe note"},
+        )
+
+    assert response.status_code == 500
+    assert "Could not resolve incident" in response.text
+    assert "secret postmortem filesystem path" not in response.text
