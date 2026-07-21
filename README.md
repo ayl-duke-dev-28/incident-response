@@ -21,6 +21,8 @@ Anthropic, GitHub, Slack, and Datadog.
 - List recent incidents without knowing an incident ID.
 - Inspect open and recently resolved incidents, including full triage and timeline
   detail, in a local web console.
+- Trigger a safe, collision-free demo incident from the console when every
+  integration and remediation mode is mocked.
 - Generate a blameless post-mortem when the incident is resolved.
 - Run a complete offline demo with no Anthropic key and no external services.
 
@@ -133,7 +135,12 @@ The console is a server-rendered operator view over the same incident data the A
 returns. It needs no frontend build, no template engine, and no external assets.
 
 ```bash
-LLM_MODE=mock incident-response serve --reload --port 8080
+LLM_MODE=mock \
+GITHUB_MODE=mock \
+SLACK_MODE=mock \
+METRICS_MODE=mock \
+REMEDIATION_MODE=mock \
+incident-response serve --reload --port 8080
 ```
 
 Open `http://localhost:8080/console`.
@@ -142,9 +149,11 @@ The incident list shows severity, service, title, status, age, metric value,
 matched runbook, and top suspect confidence, with open incidents above recently
 resolved ones. With no incidents stored, the page shows an empty state instead.
 
-To see it populated, send the test alert from the section above and reload. Triage
-runs in a background worker, so the row appears as `investigating` with `—` in its
-runbook and suspect columns, then fills those in once triage finishes.
+Select **Trigger demo incident** to enqueue a unique checkout scenario. The
+console waits for the worker to persist it, then redirects to its detail page.
+Triage continues in the background, so reload to see the suspect, runbook, and
+impact sections fill in. You can also populate the console by sending the test
+alert from the API section above.
 
 Select an incident title to open `/console/incidents/{id}`. The detail page shows:
 
@@ -156,11 +165,10 @@ Select an incident title to open `/console/incidents/{id}`. The detail page show
 Incidents still being triaged render an in-progress state instead of incomplete
 sections. Unknown incident IDs return a navigable HTML `404` page.
 
-When LLM, GitHub, Slack, metrics, and remediation modes are all `mock`, select
-**Trigger demo incident** to enqueue a collision-safe checkout scenario. The
-console waits for the worker to persist the incident, then redirects to its detail
-page. The button is hidden and the endpoint returns `403` if any mode could reach
-a real integration or execute shell remediation.
+The demo button is shown only when LLM, GitHub, Slack, metrics, and remediation
+modes are all `mock`. It is hidden and `POST /console/demo-alert` returns `403` if
+any mode could reach a real integration or execute shell remediation. Cross-site
+browser submissions are also rejected.
 
 What works today:
 
@@ -430,6 +438,8 @@ Current suite:
 125 passed, no network required
 ```
 
+Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
+
 Run lint:
 
 ```bash
@@ -513,6 +523,7 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 - No human approval workflow for shell remediation.
 - No provider-specific alert normalization beyond the shared alert schema.
 - The console is local-first and has no authentication, RBAC, or approval gates. It
-  is read-only today, but it exposes full incident detail to anyone who can reach the
-  port. Bind it to localhost.
+  exposes full incident detail to anyone who can reach the port. Its only write
+  action creates mock-only demo incidents; resolve and remediation controls remain
+  outside the console. Bind it to localhost.
 - The console does not auto-refresh. Reload to see triage progress.
