@@ -9,11 +9,11 @@ import logging
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .config import Settings
 from .models import Alert, Incident, IncidentStatus, Severity
@@ -42,6 +42,8 @@ _EMPTY_BODY = (
 )
 
 _DEMO_PERSIST_TIMEOUT_SECONDS = 1.0
+_MAX_RESOLUTION_NOTE_CHARS = 500
+_MAX_RESOLUTION_BODY_BYTES = 4096
 
 
 def _format_age(created_at: datetime, now: datetime) -> str:
@@ -111,7 +113,7 @@ def _render_table(incidents: list[Incident], now: datetime) -> str:
     )
 
 
-def _demo_enabled(settings: Settings) -> bool:
+def _mock_console_writes_enabled(settings: Settings) -> bool:
     return all(
         mode == "mock"
         for mode in (
@@ -125,7 +127,7 @@ def _demo_enabled(settings: Settings) -> bool:
 
 
 def _render_demo_button(settings: Settings) -> str:
-    if not _demo_enabled(settings):
+    if not _mock_console_writes_enabled(settings):
         return ""
     return (
         '<form method="post" action="/console/demo-alert">'
@@ -135,7 +137,7 @@ def _render_demo_button(settings: Settings) -> str:
 
 
 def _render_empty_state(settings: Settings) -> str:
-    if not _demo_enabled(settings):
+    if not _mock_console_writes_enabled(settings):
         return (
             '<section class="empty">'
             "<h2>No active incidents</h2>"
@@ -359,13 +361,33 @@ def _render_resolution(incident: Incident) -> str:
     )
 
 
-def _render_incident_detail(incident: Incident) -> str:
+def _render_resolve_action(incident: Incident, settings: Settings) -> str:
+    if (
+        not _mock_console_writes_enabled(settings)
+        or incident.status == IncidentStatus.RESOLVED
+        or incident.triage is None
+    ):
+        return ""
+    return (
+        '<section class="detail-section resolve-action"><h2>Resolve incident</h2>'
+        '<p>Record the mitigation and generate a post-mortem.</p>'
+        f'<form method="post" action="/console/incidents/{escape(incident.id)}/resolve">'
+        '<label for="resolution-note">Resolution note</label>'
+        f'<textarea id="resolution-note" name="resolution_note" maxlength="{_MAX_RESOLUTION_NOTE_CHARS}" '
+        'rows="3" placeholder="What fixed the incident?"></textarea>'
+        '<button type="submit" class="primary">Resolve incident</button>'
+        "</form></section>"
+    )
+
+
+def _render_incident_detail(incident: Incident, settings: Settings) -> str:
     body = (
         _detail_header(incident)
         + '<main class="detail-main">'
         + _render_alert_detail(incident)
         + _render_triage_detail(incident)
         + _render_timeline(incident)
+        + _render_resolve_action(incident, settings)
         + _render_resolution(incident)
         + "</main>"
     )
@@ -426,6 +448,58 @@ async def _wait_for_incident(orchestrator: IncidentOrchestrator, incident_id: st
     return False
 
 
+async def _resolution_note(request: Request) -> tuple[str | None, HTMLResponse | None]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded":
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Expected form data",
+                "Submit the resolution from the incident detail form.",
+            ),
+            status_code=415,
+        )
+
+    body = await request.body()
+    if len(body) > _MAX_RESOLUTION_BODY_BYTES:
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Resolution note too large",
+                f"Use {_MAX_RESOLUTION_NOTE_CHARS} characters or fewer.",
+            ),
+            status_code=413,
+        )
+    try:
+        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Invalid resolution note",
+                "The resolution note must be UTF-8 text.",
+            ),
+            status_code=422,
+        )
+
+    values = fields.get("resolution_note", [""])
+    if len(values) != 1:
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Invalid resolution note",
+                "Submit exactly one resolution note.",
+            ),
+            status_code=422,
+        )
+    note = values[0].strip()
+    if len(note) > _MAX_RESOLUTION_NOTE_CHARS:
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Resolution note too long",
+                f"Use {_MAX_RESOLUTION_NOTE_CHARS} characters or fewer.",
+            ),
+            status_code=422,
+        )
+    return note, None
+
+
 def register_console(
     app: FastAPI,
     *,
@@ -451,11 +525,11 @@ def register_console(
         incident = orchestrator.store.get(incident_id)
         if incident is None:
             return HTMLResponse(content=_render_not_found(incident_id), status_code=404)
-        return HTMLResponse(content=_render_incident_detail(incident))
+        return HTMLResponse(content=_render_incident_detail(incident, settings))
 
     @app.post("/console/demo-alert")
     async def console_demo_alert(request: Request) -> HTMLResponse:
-        if not _demo_enabled(settings):
+        if not _mock_console_writes_enabled(settings):
             return HTMLResponse(
                 content=_render_console_error(
                     "Demo mode unavailable",
@@ -497,5 +571,66 @@ def register_console(
                     "Return to the incident list and reload to see it when processing starts.",
                 ),
                 status_code=202,
+            )
+        return RedirectResponse(url=f"/console/incidents/{incident_id}", status_code=303)
+
+    @app.post("/console/incidents/{incident_id}/resolve")
+    async def console_resolve_incident(
+        incident_id: str, request: Request
+    ) -> Response:
+        if not _mock_console_writes_enabled(settings):
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Console writes unavailable",
+                    "Resolve incidents with the authenticated API unless every integration "
+                    "and remediation mode is set to mock.",
+                ),
+                status_code=403,
+            )
+        if _is_cross_site(request):
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Cross-site request rejected",
+                    "Open the local console directly before resolving an incident.",
+                ),
+                status_code=403,
+            )
+
+        note, error = await _resolution_note(request)
+        if error is not None:
+            return error
+
+        incident = orchestrator.store.get(incident_id)
+        if incident is None:
+            return HTMLResponse(content=_render_not_found(incident_id), status_code=404)
+        if incident.status == IncidentStatus.RESOLVED:
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Incident already resolved",
+                    "Return to the incident detail page to view its resolution.",
+                ),
+                status_code=409,
+            )
+        if incident.triage is None:
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Triage still in progress",
+                    "Wait for triage to finish before resolving this incident.",
+                ),
+                status_code=409,
+            )
+
+        try:
+            await orchestrator.resolve(incident_id, note or "")
+        except LookupError:
+            return HTMLResponse(content=_render_not_found(incident_id), status_code=404)
+        except Exception:
+            logger.exception("console_incident_resolve_failed", extra={"incident_id": incident_id})
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Could not resolve incident",
+                    "The incident was not resolved. Check the server logs and try again.",
+                ),
+                status_code=500,
             )
         return RedirectResponse(url=f"/console/incidents/{incident_id}", status_code=303)

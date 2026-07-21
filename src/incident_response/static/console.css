@@ -342,6 +342,31 @@ section h2 {
   margin-top: 0;
 }
 
+.resolve-action form {
+  display: grid;
+  gap: 10px;
+  max-width: 680px;
+}
+
+.resolve-action label {
+  font-weight: 600;
+}
+
+.resolve-action textarea {
+  width: 100%;
+  padding: 10px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+}
+
+.resolve-action button {
+  justify-self: start;
+}
+
 @media (max-width: 640px) {
   .topbar {
     align-items: flex-start;

@@ -457,7 +457,7 @@ def test_console_incident_detail_shows_resolve_form_only_for_open_mock_incidents
             alert=alert,
             status=IncidentStatus.INVESTIGATING,
             created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
-        )
+        ).model_copy(update={"triage": _triage()})
     )
     store.save(
         _incident(
@@ -491,7 +491,7 @@ def test_console_resolve_updates_incident_generates_postmortem_and_redirects(
             alert=alert,
             status=IncidentStatus.INVESTIGATING,
             created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
-        )
+        ).model_copy(update={"triage": _triage()})
     )
     app = create_app(
         settings=settings,
@@ -534,6 +534,33 @@ def test_console_resolve_returns_html_404_for_unknown_incident(tmp_path, runbook
     assert response.status_code == 404
     assert response.headers["content-type"].startswith("text/html")
     assert "Incident not found" in response.text
+
+
+def test_console_resolve_waits_for_triage_to_finish(tmp_path, runbooks_dir, alert):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-triage-running",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+    app.state.orchestrator.resolve = AsyncMock()
+
+    with TestClient(app) as client:
+        detail = client.get("/console/incidents/inc-triage-running")
+        response = client.post(
+            "/console/incidents/inc-triage-running/resolve",
+            data={"resolution_note": "too early"},
+        )
+
+    assert "Resolve incident" not in detail.text
+    assert response.status_code == 409
+    assert "Triage still in progress" in response.text
+    app.state.orchestrator.resolve.assert_not_awaited()
 
 
 def test_console_resolve_rejects_duplicate_resolution(tmp_path, runbooks_dir, alert):
@@ -681,7 +708,7 @@ def test_console_resolve_returns_safe_html_when_resolution_fails(
             alert=alert,
             status=IncidentStatus.INVESTIGATING,
             created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
-        )
+        ).model_copy(update={"triage": _triage()})
     )
     app = create_app(settings=settings, llm=FakeLLM([]))
     app.state.orchestrator.resolve = AsyncMock(
