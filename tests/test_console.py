@@ -621,6 +621,33 @@ def test_console_resolve_validates_content_type_and_note_length(
     assert store.get("inc-invalid-resolution").status == IncidentStatus.INVESTIGATING
 
 
+def test_console_resolve_accepts_500_unicode_characters(tmp_path, runbooks_dir, alert):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    incident = _incident(
+        incident_id="inc-unicode-resolution",
+        alert=alert,
+        status=IncidentStatus.INVESTIGATING,
+        created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+    ).model_copy(update={"triage": _triage()})
+    store.save(incident)
+    app = create_app(settings=settings, llm=FakeLLM([]))
+    app.state.orchestrator.resolve = AsyncMock(return_value=incident)
+    note = "🔥" * 500
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/console/incidents/inc-unicode-resolution/resolve",
+            data={"resolution_note": note},
+            follow_redirects=False,
+        )
+
+    assert response.status_code == 303
+    app.state.orchestrator.resolve.assert_awaited_once_with(
+        "inc-unicode-resolution", note
+    )
+
+
 @pytest.mark.parametrize(
     "headers",
     [
