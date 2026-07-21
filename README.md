@@ -32,7 +32,7 @@ Anthropic, GitHub, Slack, and Datadog.
 
 The fastest way to see the product work is the built-in demo. It drives the real
 FastAPI routes in-process, using mock GitHub, Slack, metrics, remediation, and
-LLM adapters.
+LLM adapters. Python 3.11 or newer is required.
 
 ```bash
 python -m venv .venv
@@ -66,7 +66,7 @@ storage, runbook, Slack mock, and metrics mock paths.
 
 ```bash
 cp .env.example .env
-LLM_MODE=mock incident-response serve --reload --port 8080
+LLM_MODE=mock incident-response serve --host 127.0.0.1 --reload --port 8080
 ```
 
 Open:
@@ -142,7 +142,7 @@ GITHUB_MODE=mock \
 SLACK_MODE=mock \
 METRICS_MODE=mock \
 REMEDIATION_MODE=mock \
-incident-response serve --reload --port 8080
+incident-response serve --host 127.0.0.1 --reload --port 8080
 ```
 
 Open `http://localhost:8080/console`.
@@ -206,7 +206,7 @@ Commands:
 | Command | Purpose |
 |---|---|
 | `incident-response demo` | Run the full incident lifecycle offline. |
-| `incident-response serve` | Start the FastAPI server. Defaults to `0.0.0.0:8080`. |
+| `incident-response serve` | Start the FastAPI server. Defaults to `0.0.0.0:8080`; pass `--host 127.0.0.1` when using the unauthenticated console locally. |
 
 Useful demo flags:
 
@@ -291,28 +291,48 @@ Any one valid credential is enough.
 
 ## Configuration
 
-All runtime settings are loaded from environment variables or `.env`.
+All runtime settings are loaded from environment variables or `.env`. The values
+below are the defaults unless the row says a credential is required.
 
 | Env var | Modes / example | Notes |
 |---|---|---|
-| `LLM_MODE` | `anthropic`, `mock` | `mock` uses deterministic local responses. |
-| `ANTHROPIC_API_KEY` | `sk-ant-...` | Required when `LLM_MODE=anthropic`. |
+| `LLM_MODE` | `anthropic` | Supports `anthropic` or `mock`; `mock` uses deterministic local responses. |
+| `ANTHROPIC_API_KEY` | empty | Required when `LLM_MODE=anthropic`. |
 | `ANTHROPIC_MODEL` | `claude-sonnet-4-6` | Anthropic model name. |
-| `GITHUB_MODE` | `mock`, `rest` | `rest` needs `GITHUB_TOKEN` and `GITHUB_REPO`. |
-| `SLACK_MODE` | `mock`, `webhook`, `bot` | `bot` enables `chat.update` streaming updates. |
-| `METRICS_MODE` | `mock`, `datadog` | `datadog` needs `DATADOG_API_KEY` and `DATADOG_APP_KEY`. |
-| `REMEDIATION_MODE` | `mock`, `shell` | `shell` can run allow-listed commands from runbooks. |
+| `GITHUB_MODE` | `mock` | Supports `mock` or `rest`; `rest` needs `GITHUB_TOKEN` and `GITHUB_REPO`. |
+| `GITHUB_TOKEN` | empty | GitHub bearer token used in `rest` mode. |
+| `GITHUB_REPO` | `owner/repo` | Repository in `owner/repo` form. |
+| `SLACK_MODE` | `mock` | Supports `mock`, `webhook`, or `bot`; `bot` enables in-place `chat.update` streaming. |
+| `SLACK_WEBHOOK_URL` | empty | Required for webhook mode; progress is posted as threaded messages rather than in-place updates. |
+| `SLACK_BOT_TOKEN` | empty | Required for bot mode and should have `chat:write`. |
+| `SLACK_CHANNEL` | `#incidents` | Destination channel for incident messages. |
+| `METRICS_MODE` | `mock` | Supports `mock` or `datadog`; Datadog mode needs both Datadog keys. |
+| `DATADOG_API_KEY` | empty | Datadog API key. |
+| `DATADOG_APP_KEY` | empty | Datadog application key. |
 | `RUNBOOKS_DIR` | `./runbooks` | Markdown runbook library. |
 | `POSTMORTEM_DIR` | `./postmortems` | Generated post-mortems. |
 | `DB_PATH` | `./incidents.db` | SQLite incident store. |
 | `WEBHOOK_TOKEN` | `change-me` | Shared webhook token. |
+| `DATADOG_WEBHOOK_SECRET` | empty | Optional Datadog HMAC secret. |
+| `PAGERDUTY_WEBHOOK_SECRET` | empty | Optional PagerDuty HMAC secret. |
+| `GENERIC_WEBHOOK_SECRET` | empty | Optional generic HMAC-SHA256 secret. |
+| `RATE_LIMIT_MAX` | `30` | Maximum alerts per client-IP/service window. |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding rate-limit window in seconds. |
+| `DEDUP_BUCKET_MINUTES` | `15` | Timestamp bucket used in alert fingerprints. |
+| `DEDUP_TTL_SECONDS` | `3600` | In-memory fingerprint lifetime in seconds. |
+| `REMEDIATION_MODE` | `mock` | Supports `mock` or `shell`; shell mode can run explicitly automated, allow-listed commands. |
 | `REMEDIATION_ALLOWED_COMMANDS` | `feature-flag,kubectl,deploy` | First-token allow list for shell remediation. |
-| `VERIFICATION_ENABLED` | `true`, `false` | Enables post-remediation metric polling. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://...` | Optional OpenTelemetry OTLP HTTP export. |
+| `REMEDIATION_TIMEOUT_SECONDS` | `30` | Per-command shell timeout. |
+| `VERIFICATION_ENABLED` | `true` | Enables metric polling after an action actually executes. |
+| `VERIFICATION_TOTAL_MINUTES` | `10` | Maximum verification duration. |
+| `VERIFICATION_POLL_SECONDS` | `30` | Delay between verification polls. |
+| `LOG_LEVEL` | `INFO` | Application log level. |
+| `OTEL_SERVICE_NAME` | `incident-response` | OpenTelemetry service name. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enables OTLP HTTP export when the optional `otel` dependencies are installed. |
 
-To use real integrations:
+To use real integrations, add values like these to `.env`:
 
-```bash
+```dotenv
 LLM_MODE=anthropic
 ANTHROPIC_API_KEY=sk-ant-...
 
@@ -429,7 +449,7 @@ where the same runbook previously recovered the system.
 
 ## Development
 
-Install with development dependencies:
+Install with Python 3.11 or newer and the development dependencies:
 
 ```bash
 python -m venv .venv
@@ -462,7 +482,7 @@ Useful smoke checks:
 ```bash
 incident-response --help
 incident-response demo
-LLM_MODE=mock incident-response serve --port 8080
+LLM_MODE=mock incident-response serve --host 127.0.0.1 --port 8080
 curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://localhost:8080/console
 curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
   http://localhost:8080/console/incidents/inc-ddg-9273
@@ -511,7 +531,7 @@ src/incident_response/
 
 tests/                 Pytest suite
 runbooks/              Example runbooks
-postmortems/           Runtime output, generated on resolve
+postmortems/           Runtime output directory, created on first resolve
 ```
 
 ## Extending It
@@ -540,5 +560,6 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
   exposes full incident detail to anyone who can reach the port. Console writes
   are restricted to demo creation and incident resolution in all-mock mode;
   real-integration resolution and remediation controls remain outside the console.
-  Bind it to localhost.
+  The CLI defaults to `0.0.0.0`, so pass `--host 127.0.0.1` unless you have placed
+  the service behind appropriate network and authentication controls.
 - The console does not auto-refresh. Reload to see triage progress.
