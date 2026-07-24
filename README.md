@@ -62,9 +62,18 @@ alert -> triage -> runbook match -> impact estimate -> incident fetch -> resolve
 ```
 
 The CLI and console demo actions use the same typed checkout scenario from
-`incident_response.demo`. The CLI keeps its deterministic alert ID and timestamp;
-the console supplies collision-safe IDs, metrics, and timestamps for repeated
-browser demos.
+`incident_response.demo`:
+
+- `build_demo_alert()` owns the shared title, service, severity, threshold, value,
+  and default tags. Its defaults preserve the deterministic CLI alert ID,
+  timestamp, and metric shown above.
+- `build_unique_console_demo_alert()` reuses that scenario while supplying a
+  unique alert ID, metric, current timestamp, and `source=console` tag for each
+  browser demo.
+
+Change the built-in demo scenario in `demo.py` instead of copying alert payloads
+into the CLI, console, or tests. The behavior is covered by the
+[shared demo alert TDD evidence](docs/testing/shared-demo-alert.tdd.md).
 
 ## Run The API Locally
 
