@@ -21,6 +21,7 @@ Anthropic, GitHub, Slack, and Datadog.
 - List recent incidents without knowing an incident ID.
 - Inspect open and recently resolved incidents, including full triage and timeline
   detail, in a local web console.
+- Open matched runbooks directly from incident list and detail views.
 - Trigger a safe, collision-free demo incident from the console when every
   integration and remediation mode is mocked.
 - Resolve triaged incidents from the all-mock console and generate their
@@ -164,6 +165,11 @@ Select an incident title to open `/console/incidents/{id}`. The detail page show
 - the remediation and resolution timeline;
 - verification results and the generated post-mortem path when available.
 
+Matched runbook names link to `/console/runbooks/{slug}`. The preview shows the
+loaded title, tags, instructions, and automated-action declarations as escaped
+Markdown source. URL slugs are matched only against runbooks loaded at startup;
+they are never resolved as filesystem paths.
+
 Incidents still being triaged render an in-progress state instead of incomplete
 sections. Once triage finishes in all-mock mode, the detail page shows a
 **Resolve incident** form. Submit an optional note of up to 500 characters to
@@ -186,6 +192,7 @@ What works today:
 |---|---|
 | `GET /console` incident list | Working. |
 | `GET /console/incidents/{id}` incident detail | Working. Shows alert, triage, impact, runbook, suspect, timeline, verification, and resolution data. |
+| `GET /console/runbooks/{slug}` runbook preview | Working. Shows escaped Markdown for an already-loaded runbook and returns an HTML `404` for unknown slugs. |
 | `GET /static/console.css` | Working. |
 | `POST /console/demo-alert` demo action | Working in all-mock mode. Enqueues a unique demo incident and redirects to its detail page. Hidden and forbidden when any integration or remediation mode is not `mock`. |
 | `POST /console/incidents/{id}/resolve` resolve action | Working in all-mock mode after triage completes. Accepts a form-encoded resolution note, generates a post-mortem, and redirects to the resolved detail page. |
@@ -230,6 +237,7 @@ Useful demo flags:
 | `GET` | `/readyz` | Liveness plus queue depth. |
 | `GET` | `/console` | Operator incident list. Returns HTML, not JSON. Unauthenticated. |
 | `GET` | `/console/incidents/{id}` | Operator incident detail. Returns HTML, including an HTML `404` for unknown IDs. Unauthenticated. |
+| `GET` | `/console/runbooks/{slug}` | Preview an already-loaded runbook as escaped Markdown. Returns an HTML `404` for unknown slugs. Unauthenticated. |
 | `POST` | `/console/demo-alert` | Enqueue a unique checkout demo and redirect to its detail page. Available only when all integrations and remediation use `mock`. |
 | `POST` | `/console/incidents/{id}/resolve` | Resolve a triaged incident from the console and redirect to its detail page. Accepts form data with an optional `resolution_note` of at most 500 characters. Available only in all-mock mode. |
 | `GET` | `/static/console.css` | Console stylesheet. |
@@ -466,7 +474,7 @@ pytest
 Current suite:
 
 ```text
-140 passed, no network required
+144 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
