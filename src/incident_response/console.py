@@ -10,13 +10,13 @@ from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
-from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .config import Settings
-from .models import Alert, Incident, IncidentStatus, Runbook, Severity
+from .demo import build_unique_console_demo_alert
+from .models import Incident, IncidentStatus, Runbook
 from .orchestrator import IncidentOrchestrator
 from .queue import AlertQueue
 
@@ -467,22 +467,6 @@ def _render_console_error(title: str, message: str) -> str:
     return _page(title, body)
 
 
-def _build_demo_alert() -> Alert:
-    token = uuid4().hex
-    return Alert(
-        id=f"demo-checkout-{token}",
-        title="Checkout 5xx > 5%",
-        description="checkout service error rate at 18%",
-        service="checkout",
-        severity=Severity.SEV2,
-        triggered_at=datetime.now(timezone.utc),
-        metric=f"http.error_rate.demo-{token}",
-        threshold=0.05,
-        value=0.184,
-        tags={"env": "demo", "source": "console"},
-    )
-
-
 def _is_cross_site(request: Request) -> bool:
     if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
         return True
@@ -612,7 +596,7 @@ def register_console(
                 status_code=403,
             )
 
-        alert = _build_demo_alert()
+        alert = build_unique_console_demo_alert()
         incident_id = f"inc-{alert.id}"
         try:
             await queue.submit(alert)
