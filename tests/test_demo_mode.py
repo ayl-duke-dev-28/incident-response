@@ -3,6 +3,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from incident_response.config import Settings
+from incident_response.demo import build_demo_alert
 from incident_response.main import create_app
 
 
@@ -21,18 +22,7 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def _alert_payload() -> dict[str, object]:
-    return {
-        "id": "demo-checkout-001",
-        "title": "Checkout 5xx > 5%",
-        "description": "checkout service error rate at 18%",
-        "service": "checkout",
-        "severity": "sev2",
-        "triggered_at": "2026-07-02T21:05:00+00:00",
-        "metric": "http.error_rate",
-        "threshold": 0.05,
-        "value": 0.184,
-        "tags": {"env": "demo"},
-    }
+    return build_demo_alert().model_dump(mode="json")
 
 
 def _wait_for_triage(client: TestClient, incident_id: str) -> dict[str, object]:
