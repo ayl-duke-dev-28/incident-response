@@ -154,9 +154,10 @@ resolved ones. With no incidents stored, the page shows an empty state instead.
 
 Select **Trigger demo incident** to enqueue a unique checkout scenario. The
 console waits for the worker to persist it, then redirects to its detail page.
-Triage continues in the background, so reload to see the suspect, runbook, and
-impact sections fill in. You can also populate the console by sending the test
-alert from the API section above.
+While triage continues in the background, the detail page shows a visible status
+message and refreshes every three seconds. Refreshing stops as soon as triage data
+is available. You can also populate the console by sending the test alert from the
+API section above.
 
 Select an incident title to open `/console/incidents/{id}`. The detail page shows:
 
@@ -171,10 +172,11 @@ Markdown source. URL slugs are matched only against runbooks loaded at startup;
 they are never resolved as filesystem paths.
 
 Incidents still being triaged render an in-progress state instead of incomplete
-sections. Once triage finishes in all-mock mode, the detail page shows a
-**Resolve incident** form. Submit an optional note of up to 500 characters to
-mark the incident resolved, generate its post-mortem, and return to the updated
-detail page. Unknown incident IDs return a navigable HTML `404` page.
+sections and opt into the three-second refresh. Completed and resolved incidents
+do not refresh automatically. Once triage finishes in all-mock mode, the detail
+page shows a **Resolve incident** form. Submit an optional note of up to 500
+characters to mark the incident resolved, generate its post-mortem, and return to
+the updated detail page. Unknown incident IDs return a navigable HTML `404` page.
 
 The demo button is shown only when LLM, GitHub, Slack, metrics, and remediation
 modes are all `mock`. It is hidden and `POST /console/demo-alert` returns `403` if
@@ -191,7 +193,7 @@ What works today:
 | Surface | Status |
 |---|---|
 | `GET /console` incident list | Working. |
-| `GET /console/incidents/{id}` incident detail | Working. Shows alert, triage, impact, runbook, suspect, timeline, verification, and resolution data. |
+| `GET /console/incidents/{id}` incident detail | Working. Shows alert, triage, impact, runbook, suspect, timeline, verification, and resolution data. Refreshes every three seconds only while triage is pending. |
 | `GET /console/runbooks/{slug}` runbook preview | Working. Shows escaped Markdown for an already-loaded runbook and returns an HTML `404` for unknown slugs. |
 | `GET /static/console.css` | Working. |
 | `POST /console/demo-alert` demo action | Working in all-mock mode. Enqueues a unique demo incident and redirects to its detail page. Hidden and forbidden when any integration or remediation mode is not `mock`. |
@@ -474,7 +476,7 @@ pytest
 Current suite:
 
 ```text
-144 passed, no network required
+147 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -572,4 +574,6 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
   real-integration resolution and remediation controls remain outside the console.
   The CLI defaults to `0.0.0.0`, so pass `--host 127.0.0.1` unless you have placed
   the service behind appropriate network and authentication controls.
-- The console does not auto-refresh. Reload to see triage progress.
+- The console uses a three-second full-page refresh while triage is pending. It
+  does not use WebSockets or push updates, and completed or resolved incidents do
+  not refresh.
