@@ -311,6 +311,23 @@ section h2 {
   margin-top: 0;
 }
 
+.runbook-tags {
+  margin: 0 0 16px;
+}
+
+.runbook-source {
+  margin: 0;
+  padding: 18px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font: 13px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 .timeline {
   margin: 0;
   padding-left: 24px;

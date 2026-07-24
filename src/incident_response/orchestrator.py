@@ -98,6 +98,15 @@ class IncidentOrchestrator:
         """Read access to persisted incidents for API and console routes."""
         return self._store
 
+    def get_runbook(self, slug: str) -> Runbook | None:
+        """Return an already-loaded runbook by exact slug.
+
+        Console URL input must never be resolved as a filesystem path. Runbooks
+        are loaded during startup, so an exact lookup also keeps preview reads
+        deterministic and confined to the configured library.
+        """
+        return next((runbook for runbook in self._runbooks if runbook.slug == slug), None)
+
     async def _stream_triage(
         self,
         alert: Alert,

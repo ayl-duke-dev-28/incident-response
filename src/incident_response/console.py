@@ -9,14 +9,14 @@ import logging
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .config import Settings
-from .models import Alert, Incident, IncidentStatus, Severity
+from .models import Alert, Incident, IncidentStatus, Runbook, Severity
 from .orchestrator import IncidentOrchestrator
 from .queue import AlertQueue
 
@@ -68,10 +68,13 @@ def _format_value(incident: Incident) -> str:
 
 
 def _format_runbook(incident: Incident) -> str:
-    # Plain text until /console/runbooks/{slug} exists — see PLAN.md Phase 3.
     if incident.triage is None or incident.triage.runbook is None:
         return "—"
-    return escape(incident.triage.runbook.runbook.slug)
+    slug = incident.triage.runbook.runbook.slug
+    return (
+        f'<a href="/console/runbooks/{quote(slug, safe="")}">'
+        f"{escape(slug)}</a>"
+    )
 
 
 def _format_confidence(incident: Incident) -> str:
@@ -301,9 +304,10 @@ def _render_triage_detail(incident: Incident) -> str:
         runbook = '<p class="muted">No matching runbook.</p>'
     else:
         match = triage.runbook
+        runbook_href = f"/console/runbooks/{quote(match.runbook.slug, safe='')}"
         runbook = (
             '<article class="runbook">'
-            f"<h3>{escape(match.runbook.title)}</h3>"
+            f'<h3><a href="{runbook_href}">{escape(match.runbook.title)}</a></h3>'
             f'<p><code>{escape(match.runbook.slug)}</code> · {match.confidence:.0%} match</p>'
             f"<p>{escape(match.reasoning)}</p>"
             "</article>"
@@ -401,6 +405,36 @@ def _render_not_found(incident_id: str) -> str:
         '<a href="/console">← All incidents</a></main>'
     )
     return _page("Incident not found", body)
+
+
+def _render_runbook_preview(runbook: Runbook) -> str:
+    tags = "—"
+    if runbook.tags:
+        tags = " ".join(f'<span class="tag">{escape(tag)}</span>' for tag in runbook.tags)
+    body = (
+        '<header class="detail-header">'
+        '<a class="back" href="/console">← All incidents</a>'
+        '<div class="detail-heading">'
+        "<h1>" + escape(runbook.title) + "</h1>"
+        f'<span class="incident-id">{escape(runbook.slug)}</span>'
+        "</div></header>"
+        '<main class="detail-main">'
+        '<section class="detail-section runbook-preview">'
+        "<h2>Runbook</h2>"
+        f'<div class="runbook-tags">{tags}</div>'
+        f'<pre class="runbook-source">{escape(runbook.content)}</pre>'
+        "</section></main>"
+    )
+    return _page(f"{runbook.title} · Runbook", body)
+
+
+def _render_runbook_not_found(slug: str) -> str:
+    body = (
+        '<main class="not-found"><h1>Runbook not found</h1>'
+        f'<p>No loaded runbook exists with slug <code>{escape(slug)}</code>.</p>'
+        '<a href="/console">← All incidents</a></main>'
+    )
+    return _page("Runbook not found", body)
 
 
 def _render_console_error(title: str, message: str) -> str:
@@ -526,6 +560,16 @@ def register_console(
         if incident is None:
             return HTMLResponse(content=_render_not_found(incident_id), status_code=404)
         return HTMLResponse(content=_render_incident_detail(incident, settings))
+
+    @app.get("/console/runbooks/{slug:path}", response_class=HTMLResponse)
+    async def console_runbook(slug: str) -> HTMLResponse:
+        runbook = orchestrator.get_runbook(slug)
+        if runbook is None:
+            return HTMLResponse(
+                content=_render_runbook_not_found(slug),
+                status_code=404,
+            )
+        return HTMLResponse(content=_render_runbook_preview(runbook))
 
     @app.post("/console/demo-alert")
     async def console_demo_alert(request: Request) -> HTMLResponse:
