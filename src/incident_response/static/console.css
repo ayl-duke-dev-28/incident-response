@@ -233,6 +233,15 @@ section h2 {
   margin: 0 auto;
 }
 
+.refresh-status {
+  margin: 0 0 20px;
+  padding: 10px 14px;
+  background: #fff8e8;
+  border: 1px solid #e6cf95;
+  border-radius: 4px;
+  color: #6f5210;
+}
+
 .detail-section {
   padding: 20px;
   background: var(--surface);

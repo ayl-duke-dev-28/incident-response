@@ -42,6 +42,7 @@ _EMPTY_BODY = (
 )
 
 _DEMO_PERSIST_TIMEOUT_SECONDS = 1.0
+_TRIAGE_REFRESH_SECONDS = 3
 _MAX_RESOLUTION_NOTE_CHARS = 500
 _MAX_RESOLUTION_BODY_BYTES = 8192
 
@@ -167,11 +168,17 @@ def _render_environment(settings: Settings) -> str:
     return f'<div class="modes">{tags}</div>'
 
 
-def _page(title: str, body: str) -> str:
+def _page(title: str, body: str, *, refresh_seconds: int | None = None) -> str:
+    refresh = (
+        f'<meta http-equiv="refresh" content="{refresh_seconds}">'
+        if refresh_seconds is not None
+        else ""
+    )
     return (
         "<!doctype html>"
         '<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"{refresh}"
         f"<title>{escape(title)}</title>"
         '<link rel="stylesheet" href="/static/console.css">'
         f"</head><body>{body}</body></html>"
@@ -385,9 +392,19 @@ def _render_resolve_action(incident: Incident, settings: Settings) -> str:
 
 
 def _render_incident_detail(incident: Incident, settings: Settings) -> str:
+    triage_in_progress = incident.triage is None
+    refresh_status = ""
+    if triage_in_progress:
+        refresh_status = (
+            '<p class="refresh-status" role="status">'
+            "<strong>Triage in progress.</strong> "
+            f"Refreshing automatically every {_TRIAGE_REFRESH_SECONDS} seconds."
+            "</p>"
+        )
     body = (
         _detail_header(incident)
         + '<main class="detail-main">'
+        + refresh_status
         + _render_alert_detail(incident)
         + _render_triage_detail(incident)
         + _render_timeline(incident)
@@ -395,7 +412,11 @@ def _render_incident_detail(incident: Incident, settings: Settings) -> str:
         + _render_resolution(incident)
         + "</main>"
     )
-    return _page(f"{incident.id} · Incident console", body)
+    return _page(
+        f"{incident.id} · Incident console",
+        body,
+        refresh_seconds=_TRIAGE_REFRESH_SECONDS if triage_in_progress else None,
+    )
 
 
 def _render_not_found(incident_id: str) -> str:
