@@ -61,6 +61,11 @@ That run covers the full golden path:
 alert -> triage -> runbook match -> impact estimate -> incident fetch -> resolve -> postmortem
 ```
 
+The CLI and console demo actions use the same typed checkout scenario from
+`incident_response.demo`. The CLI keeps its deterministic alert ID and timestamp;
+the console supplies collision-safe IDs, metrics, and timestamps for repeated
+browser demos.
+
 ## Run The API Locally
 
 Use mock LLM mode for local API development. This keeps the first server run free
@@ -485,7 +490,7 @@ pytest
 Current suite:
 
 ```text
-147 passed, no network required
+149 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -518,6 +523,7 @@ curl -i -X POST \
 ```text
 src/incident_response/
   cli.py               CLI for serve and offline demo
+  demo.py              Shared typed alert scenario for CLI and console demos
   main.py              FastAPI app, lifespan worker, auth, rate limit, dedup
   console.py           Server-rendered operator console (HTML, no template engine)
   orchestrator.py      Alert -> triage -> brief -> remediate -> resolve -> post-mortem
