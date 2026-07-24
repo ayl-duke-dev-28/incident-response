@@ -271,6 +271,109 @@ def test_console_incident_detail_renders_triage_remediation_and_resolution(
     assert 'href="/console"' in response.text
 
 
+def test_console_links_matched_runbook_from_list_and_incident_detail(
+    tmp_path, runbooks_dir, alert
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-runbook-link",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        ).model_copy(update={"triage": _triage()})
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        console = client.get("/console")
+        detail = client.get("/console/incidents/inc-runbook-link")
+
+    runbook_href = 'href="/console/runbooks/checkout-error-rate"'
+    assert runbook_href in console.text
+    assert runbook_href in detail.text
+
+
+def test_console_runbook_preview_renders_escaped_title_tags_and_instructions(tmp_path):
+    runbooks_dir = tmp_path / "runbooks"
+    runbooks_dir.mkdir()
+    (runbooks_dir / "safe-preview.md").write_text(
+        """---
+title: Preview <script>alert(1)</script>
+tags: [checkout, <img>]
+---
+
+# Recovery instructions
+
+Run `deploy rollback checkout`.
+
+## Automated actions
+```json
+[{"name": "rollback", "command": "deploy rollback checkout"}]
+```
+""",
+        encoding="utf-8",
+    )
+    app = create_app(
+        settings=_settings(tmp_path, runbooks_dir),
+        llm=FakeLLM([]),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/console/runbooks/safe-preview")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Preview &lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+    assert "checkout" in response.text
+    assert "&lt;img&gt;" in response.text
+    assert "Recovery instructions" in response.text
+    assert "deploy rollback checkout" in response.text
+    assert "<script>alert(1)</script>" not in response.text
+    assert "<img>" not in response.text
+    assert 'href="/console"' in response.text
+
+
+def test_console_runbook_preview_returns_navigable_html_404_for_unknown_slug(
+    tmp_path, runbooks_dir
+):
+    app = create_app(
+        settings=_settings(tmp_path, runbooks_dir),
+        llm=FakeLLM([]),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/console/runbooks/not-a-runbook")
+
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Runbook not found" in response.text
+    assert "not-a-runbook" in response.text
+    assert 'href="/console"' in response.text
+
+
+def test_console_runbook_preview_does_not_resolve_url_slugs_as_filesystem_paths(
+    tmp_path
+):
+    runbooks_dir = tmp_path / "runbooks"
+    runbooks_dir.mkdir()
+    (runbooks_dir / "known.md").write_text("# Known", encoding="utf-8")
+    (tmp_path / "outside.md").write_text("filesystem-secret-sentinel", encoding="utf-8")
+    app = create_app(
+        settings=_settings(tmp_path, runbooks_dir),
+        llm=FakeLLM([]),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/console/runbooks/..%2Foutside")
+
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Runbook not found" in response.text
+    assert "filesystem-secret-sentinel" not in response.text
+
+
 def test_console_incident_detail_handles_triage_in_progress(tmp_path, runbooks_dir, alert):
     settings = _settings(tmp_path, runbooks_dir)
     store = IncidentStore(settings.db_path)
