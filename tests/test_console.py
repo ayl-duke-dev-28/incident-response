@@ -395,6 +395,58 @@ def test_console_incident_detail_handles_triage_in_progress(tmp_path, runbooks_d
     assert "No timeline events recorded" in response.text
 
 
+def test_console_incident_detail_auto_refreshes_while_triage_is_in_progress(
+    tmp_path, runbooks_dir, alert
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id="inc-auto-refresh",
+            alert=alert,
+            status=IncidentStatus.INVESTIGATING,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        )
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.get("/console/incidents/inc-auto-refresh")
+
+    assert '<meta http-equiv="refresh" content="3">' in response.text
+    assert "Refreshing automatically every 3 seconds" in response.text
+    assert 'role="status"' in response.text
+
+
+@pytest.mark.parametrize(
+    ("incident_id", "status"),
+    [
+        ("inc-triage-complete", IncidentStatus.INVESTIGATING),
+        ("inc-resolved-static", IncidentStatus.RESOLVED),
+    ],
+)
+def test_console_incident_detail_stops_auto_refresh_after_triage(
+    tmp_path, runbooks_dir, alert, incident_id, status
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    store = IncidentStore(settings.db_path)
+    store.save(
+        _incident(
+            incident_id=incident_id,
+            alert=alert,
+            status=status,
+            created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+        ).model_copy(update={"triage": _triage()})
+    )
+    app = create_app(settings=settings, llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.get(f"/console/incidents/{incident_id}")
+
+    assert 'http-equiv="refresh"' not in response.text
+    assert "Refreshing automatically" not in response.text
+
+
 def test_console_incident_detail_returns_html_404(tmp_path, runbooks_dir):
     app = create_app(settings=_settings(tmp_path, runbooks_dir), llm=FakeLLM([]))
 
