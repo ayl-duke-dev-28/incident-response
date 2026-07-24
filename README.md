@@ -21,6 +21,8 @@ Anthropic, GitHub, Slack, and Datadog.
 - List recent incidents without knowing an incident ID.
 - Inspect open and recently resolved incidents, including full triage and timeline
   detail, in a local web console.
+- Leave an incident detail page open while triage runs; it refreshes every three
+  seconds until the completed evidence is available.
 - Open matched runbooks directly from incident list and detail views.
 - Trigger a safe, collision-free demo incident from the console when every
   integration and remediation mode is mocked.
@@ -198,6 +200,13 @@ What works today:
 | `GET /static/console.css` | Working. |
 | `POST /console/demo-alert` demo action | Working in all-mock mode. Enqueues a unique demo incident and redirects to its detail page. Hidden and forbidden when any integration or remediation mode is not `mock`. |
 | `POST /console/incidents/{id}/resolve` resolve action | Working in all-mock mode after triage completes. Accepts a form-encoded resolution note, generates a post-mortem, and redirects to the resolved detail page. |
+
+The refresh behavior has integration coverage for pending, completed, and
+resolved incidents. Browser QA also exercised the empty, demo, in-progress,
+completed, runbook, resolved, HTML `404`, and mobile states with no findings
+(`100/100`). See the
+[console triage auto-refresh TDD evidence](docs/testing/console-triage-auto-refresh.tdd.md)
+for the exact test commands and results.
 
 The console is local-first and unauthenticated. See Current Limits before exposing
 it on anything other than localhost.
