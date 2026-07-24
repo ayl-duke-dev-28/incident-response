@@ -494,6 +494,8 @@ LLM_MODE=mock incident-response serve --host 127.0.0.1 --port 8080
 curl -s -o /dev/null -w "%{http_code} %{content_type}\n" http://localhost:8080/console
 curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
   http://localhost:8080/console/incidents/inc-ddg-9273
+curl -s -o /dev/null -w "%{http_code} %{content_type}\n" \
+  http://localhost:8080/console/runbooks/checkout-error-rate
 curl -i -X POST http://localhost:8080/console/demo-alert
 curl -i -X POST \
   --data-urlencode "resolution_note=rolled back the pricing cache" \
