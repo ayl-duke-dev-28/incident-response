@@ -17,7 +17,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .agents.llm import AnthropicLLM, DemoLLM, LLM
 from .config import Settings, load_settings
@@ -117,6 +117,11 @@ class AlertPayload(BaseModel):
 
 class ResolvePayload(BaseModel):
     resolution_note: str = ""
+
+
+class RemediationDecisionPayload(BaseModel):
+    decided_by: str = Field(min_length=1, max_length=100)
+    note: str = Field(default="", max_length=500)
 
 
 def create_app(settings: Settings | None = None, llm: LLM | None = None) -> FastAPI:
@@ -222,6 +227,44 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
             return await orchestrator.resolve(incident_id, payload.resolution_note)
         except LookupError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/alerts/{incident_id}/remediation/approve")
+    async def approve_remediation(
+        incident_id: str,
+        payload: RemediationDecisionPayload,
+        request: Request,
+        _body: bytes = Depends(_verify_inbound),
+    ) -> Incident:
+        set_incident_id(incident_id)
+        try:
+            return await orchestrator.approve_remediation(
+                incident_id,
+                decided_by=payload.decided_by,
+                note=payload.note,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/alerts/{incident_id}/remediation/reject")
+    async def reject_remediation(
+        incident_id: str,
+        payload: RemediationDecisionPayload,
+        request: Request,
+        _body: bytes = Depends(_verify_inbound),
+    ) -> Incident:
+        set_incident_id(incident_id)
+        try:
+            return await orchestrator.reject_remediation(
+                incident_id,
+                decided_by=payload.decided_by,
+                note=payload.note,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/incidents")
     async def list_incidents(

@@ -21,6 +21,14 @@ class IncidentStatus(str, Enum):
     RESOLVED = "resolved"
 
 
+class RemediationStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 class Alert(BaseModel):
     """Inbound alert payload from a monitoring system."""
 
@@ -130,6 +138,29 @@ class VerificationOutcome(BaseModel):
     runbook_slug: str | None = None
 
 
+class RemediationStep(BaseModel):
+    """Persisted preview of a proposed runbook action."""
+
+    model_config = {"frozen": True}
+
+    name: str
+    command: str
+    auto: bool = False
+
+
+class RemediationRequest(BaseModel):
+    """Approval and execution state for one incident's proposed remediation."""
+
+    status: RemediationStatus
+    runbook_slug: str
+    requested_at: datetime
+    steps: list[RemediationStep]
+    decided_at: datetime | None = None
+    decided_by: str | None = None
+    note: str = ""
+    execution_summary: str | None = None
+
+
 class Incident(BaseModel):
     id: str
     alert: Alert
@@ -141,6 +172,7 @@ class Incident(BaseModel):
     postmortem_path: str | None = None
     timeline: list[dict[str, Any]] = Field(default_factory=list)
     verification_outcome: VerificationOutcome | None = None
+    remediation: RemediationRequest | None = None
 
 
 class MetricPoint(BaseModel):

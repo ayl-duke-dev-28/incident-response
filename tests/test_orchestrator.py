@@ -55,12 +55,14 @@ async def test_handle_alert_posts_brief_and_saves_incident(
     assert incident.triage.suspects[0].commit.sha == "a1b2c3d"
     assert incident.triage.runbook.runbook.slug == "checkout-error-rate"
     assert incident.triage.impact.affected_users == 2200
-    # 1st post: brief. 2nd: mock-executor remediation summary (checkout-error-rate has actions).
+    # 1st post: brief. 2nd: persisted remediation approval request.
     assert len(slack.sent) == 2
     assert "SEV2" in slack.sent[0].text
     assert "a1b2c3d" in slack.sent[0].text
     assert slack.sent[1].thread_ts == slack.sent[0].ts
-    assert "Automated remediation" in slack.sent[1].text
+    assert "Remediation approval required" in slack.sent[1].text
+    assert incident.remediation is not None
+    assert incident.remediation.status.value == "pending"
     assert incident.slack_message_ts is not None
 
 
@@ -87,7 +89,7 @@ async def test_resolve_generates_postmortem_and_threads_reply(
     assert resolved.postmortem_path is not None
     pm_text = open(resolved.postmortem_path).read()
     assert "Post-Mortem" in pm_text
-    # 1: brief. 2: remediation summary. 3: post-mortem thread reply.
+    # 1: brief. 2: approval request. 3: post-mortem thread reply.
     assert len(slack.sent) == 3
     assert slack.sent[2].thread_ts == slack.sent[0].ts
     assert "Post-mortem" in slack.sent[2].text

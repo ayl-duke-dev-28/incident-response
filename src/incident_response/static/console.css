@@ -393,6 +393,67 @@ section h2 {
   justify-self: start;
 }
 
+.remediation-approval {
+  border-left: 4px solid var(--sev2);
+}
+
+.remediation-steps {
+  display: grid;
+  gap: 10px;
+  padding-left: 24px;
+}
+
+.remediation-steps li {
+  padding-left: 4px;
+}
+
+.remediation-steps code,
+.remediation-steps span {
+  display: block;
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.approval-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.approval-actions form {
+  display: grid;
+  gap: 8px;
+}
+
+.approval-actions label {
+  font-weight: 600;
+}
+
+.approval-actions textarea {
+  width: 100%;
+  padding: 10px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  background: var(--surface);
+  font: inherit;
+}
+
+button.danger {
+  justify-self: start;
+  min-height: var(--touch-target);
+  padding: 0 16px;
+  border: 1px solid var(--sev1);
+  border-radius: 4px;
+  color: var(--sev1);
+  background: var(--surface);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
 @media (max-width: 640px) {
   .topbar {
     align-items: flex-start;
@@ -408,6 +469,10 @@ section h2 {
   }
 
   .detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .approval-actions {
     grid-template-columns: 1fr;
   }
 }

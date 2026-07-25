@@ -117,6 +117,11 @@ async def test_verification_scheduled_after_real_execution(alert, tmp_db, runboo
         executor=_AlwaysExecuteExecutor(),
     )
     incident = await orch.handle_alert(alert)
+    incident = await orch.approve_remediation(
+        incident.id,
+        decided_by="test-on-call",
+        note="verify after approved execution",
+    )
 
     # Drain the fire-and-forget verification task (poll_seconds=1, total_minutes=1)
     import asyncio

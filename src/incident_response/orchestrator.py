@@ -24,6 +24,7 @@ from .dedup import DedupIndex, alert_fingerprint
 from .executor import (
     MockExecutor,
     RemediationExecutor,
+    RunbookStep,
     format_results_for_slack,
     parse_steps,
 )
@@ -41,6 +42,9 @@ from .models import (
     IncidentStatus,
     MetricSeries,
     PriorIncident,
+    RemediationRequest,
+    RemediationStatus,
+    RemediationStep,
     Runbook,
     RunbookMatch,
     SuspectCommit,
@@ -90,6 +94,7 @@ class IncidentOrchestrator:
         self._config = config
         self._dedup = dedup or DedupIndex()
         self._executor = executor or MockExecutor()
+        self._remediation_lock = asyncio.Lock()
         self._runbooks: list[Runbook] = load_runbooks(config.runbooks_dir)
         self._history = PostmortemHistory.load(config.postmortem_dir)
 
@@ -268,7 +273,7 @@ class IncidentOrchestrator:
         self._dedup.set(fingerprint, incident.id)
         logger.info("incident_opened", extra={"service": alert.service, "severity": alert.severity.value})
 
-        triage, slack_ts, baseline_series = await self._stream_triage(
+        triage, slack_ts, _baseline_series = await self._stream_triage(
             alert, self._config.slack_channel
         )
         incident = incident.model_copy(
@@ -292,31 +297,218 @@ class IncidentOrchestrator:
         await self._maybe_annotate_pr(incident, triage)
 
         if triage.runbook:
-            remediation_summary, executed_any = await self._run_remediation(
-                triage.runbook.runbook, slack_ts
-            )
-            if remediation_summary:
+            steps = parse_steps(triage.runbook.runbook)
+            if steps:
+                requested_at = datetime.now(timezone.utc)
+                remediation = RemediationRequest(
+                    status=RemediationStatus.PENDING,
+                    runbook_slug=triage.runbook.runbook.slug,
+                    requested_at=requested_at,
+                    steps=[
+                        RemediationStep(
+                            name=step.name,
+                            command=step.command,
+                            auto=step.auto,
+                        )
+                        for step in steps
+                    ],
+                )
                 incident = incident.model_copy(
                     update={
+                        "remediation": remediation,
                         "timeline": incident.timeline
                         + [
                             {
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                                "event": remediation_summary,
+                                "timestamp": requested_at.isoformat(),
+                                "event": (
+                                    "Remediation approval required: "
+                                    f"{len(steps)} action(s) proposed by "
+                                    f"runbook {remediation.runbook_slug}"
+                                ),
                             }
-                        ]
+                        ],
                     }
                 )
                 self._store.save(incident)
-            if executed_any and self._config.verification_enabled:
-                self._schedule_verification(
-                    incident.id,
-                    alert,
-                    baseline_series,
-                    slack_ts,
-                    triage.runbook.runbook.slug if triage.runbook else None,
+                await self._slack.post(
+                    channel=self._config.slack_channel,
+                    text=(
+                        ":raised_hand: *Remediation approval required*\n"
+                        f"Runbook `{remediation.runbook_slug}` proposes "
+                        f"{len(steps)} action(s). Approve or reject incident "
+                        f"`{incident.id}` before anything runs."
+                    ),
+                    thread_ts=slack_ts,
                 )
         return incident
+
+    async def approve_remediation(
+        self,
+        incident_id: str,
+        *,
+        decided_by: str,
+        note: str = "",
+    ) -> Incident:
+        """Persist approval before executing, making retries safe."""
+
+        async with self._remediation_lock:
+            incident = self._pending_remediation(incident_id)
+            now = datetime.now(timezone.utc)
+            approved = incident.remediation.model_copy(
+                update={
+                    "status": RemediationStatus.APPROVED,
+                    "decided_at": now,
+                    "decided_by": decided_by,
+                    "note": note,
+                }
+            )
+            incident = incident.model_copy(
+                update={
+                    "remediation": approved,
+                    "timeline": incident.timeline
+                    + [
+                        {
+                            "timestamp": now.isoformat(),
+                            "event": (
+                                f"Remediation approved by {decided_by}."
+                                f"{f' {note}' if note else ''}"
+                            ),
+                        }
+                    ],
+                }
+            )
+            self._store.save(incident)
+
+            baseline_series: MetricSeries | None = None
+            if self._config.verification_enabled:
+                try:
+                    baseline_series = await self._metrics.error_rate(
+                        incident.alert.service,
+                        minutes=_IMPACT_WINDOW_MINUTES,
+                    )
+                except Exception:
+                    logger.exception(
+                        "remediation_verification_baseline_failed",
+                        extra={"incident_id": incident_id},
+                    )
+
+            try:
+                summary, executed_any = await self._run_remediation(
+                    approved.steps,
+                    incident.slack_message_ts,
+                )
+            except Exception:
+                self._fail_remediation(incident, "Remediation executor failed")
+                raise
+
+            completed_at = datetime.now(timezone.utc)
+            completed = approved.model_copy(
+                update={
+                    "status": RemediationStatus.COMPLETED,
+                    "execution_summary": summary or "No remediation steps were executed.",
+                }
+            )
+            incident = incident.model_copy(
+                update={
+                    "remediation": completed,
+                    "timeline": incident.timeline
+                    + [
+                        {
+                            "timestamp": completed_at.isoformat(),
+                            "event": summary or "Remediation completed with no executable steps.",
+                        }
+                    ],
+                }
+            )
+            self._store.save(incident)
+
+            if (
+                executed_any
+                and self._config.verification_enabled
+                and baseline_series is not None
+                and incident.slack_message_ts
+            ):
+                self._schedule_verification(
+                    incident.id,
+                    incident.alert,
+                    baseline_series,
+                    incident.slack_message_ts,
+                    approved.runbook_slug,
+                )
+            return incident
+
+    async def reject_remediation(
+        self,
+        incident_id: str,
+        *,
+        decided_by: str,
+        note: str = "",
+    ) -> Incident:
+        """Reject a pending proposal permanently without invoking the executor."""
+
+        async with self._remediation_lock:
+            incident = self._pending_remediation(incident_id)
+            now = datetime.now(timezone.utc)
+            rejected = incident.remediation.model_copy(
+                update={
+                    "status": RemediationStatus.REJECTED,
+                    "decided_at": now,
+                    "decided_by": decided_by,
+                    "note": note,
+                }
+            )
+            event = f"Remediation rejected by {decided_by}."
+            if note:
+                event += f" {note}"
+            incident = incident.model_copy(
+                update={
+                    "remediation": rejected,
+                    "timeline": incident.timeline
+                    + [{"timestamp": now.isoformat(), "event": event}],
+                }
+            )
+            self._store.save(incident)
+            if incident.slack_message_ts:
+                await self._slack.post(
+                    channel=self._config.slack_channel,
+                    text=f":no_entry: {event}",
+                    thread_ts=incident.slack_message_ts,
+                )
+            return incident
+
+    def _pending_remediation(self, incident_id: str) -> Incident:
+        set_incident_id(incident_id)
+        incident = self._store.get(incident_id)
+        if incident is None:
+            raise LookupError(f"Unknown incident: {incident_id}")
+        if incident.status == IncidentStatus.RESOLVED:
+            raise ValueError("Cannot decide remediation for a resolved incident")
+        remediation = incident.remediation
+        if remediation is None:
+            raise ValueError("Incident has no remediation awaiting approval")
+        if remediation.status != RemediationStatus.PENDING:
+            raise ValueError(
+                f"Remediation already decided: {remediation.status.value}"
+            )
+        return incident
+
+    def _fail_remediation(self, incident: Incident, summary: str) -> Incident:
+        now = datetime.now(timezone.utc)
+        failed = incident.remediation.model_copy(
+            update={
+                "status": RemediationStatus.FAILED,
+                "execution_summary": summary,
+            }
+        )
+        failed_incident = incident.model_copy(
+            update={
+                "remediation": failed,
+                "timeline": incident.timeline
+                + [{"timestamp": now.isoformat(), "event": summary}],
+            }
+        )
+        self._store.save(failed_incident)
+        return failed_incident
 
     async def _maybe_annotate_pr(self, incident: Incident, triage: TriageReport) -> None:
         """Post an incident-context comment on the suspect commit's PR when the
@@ -407,9 +599,12 @@ class IncidentOrchestrator:
         self._store.save(incident.model_copy(update={"verification_outcome": outcome}))
 
     async def _run_remediation(
-        self, runbook: Runbook, thread_ts: str
+        self, persisted_steps: list[RemediationStep], thread_ts: str | None
     ) -> tuple[str, bool]:
-        steps = parse_steps(runbook)
+        steps = [
+            RunbookStep(name=step.name, command=step.command, auto=step.auto)
+            for step in persisted_steps
+        ]
         if not steps:
             return "", False
         results = await self._executor.run(steps)

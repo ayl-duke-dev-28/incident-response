@@ -165,6 +165,43 @@ async def test_rejection_is_final_and_never_executes(
     assert executor.calls == []
 
 
+async def test_approval_executes_the_persisted_proposal_if_runbook_changes(
+    alert, tmp_db, postmortem_dir, runbooks_dir
+):
+    executor = RecordingExecutor()
+    orchestrator, _, _ = _build_orchestrator(
+        tmp_db=tmp_db,
+        postmortem_dir=postmortem_dir,
+        runbooks_dir=runbooks_dir,
+        executor=executor,
+    )
+    incident = await orchestrator.handle_alert(alert)
+    approved_commands = [step.command for step in incident.remediation.steps]
+
+    original = orchestrator.get_runbook("checkout-error-rate")
+    assert original is not None
+    changed = original.model_copy(
+        update={
+            "content": (
+                "## Automated actions\n```json\n"
+                '[{"name":"changed after review","command":"deploy unexpected","auto":true}]\n'
+                "```"
+            )
+        }
+    )
+    orchestrator._runbooks = [
+        changed if runbook.slug == changed.slug else runbook
+        for runbook in orchestrator._runbooks
+    ]
+
+    await orchestrator.approve_remediation(
+        incident.id,
+        decided_by="careful-operator",
+    )
+
+    assert [step.command for step in executor.calls[0]] == approved_commands
+
+
 def _settings(tmp_path: Path, runbooks_dir: Path) -> Settings:
     return Settings(
         llm_mode="mock",

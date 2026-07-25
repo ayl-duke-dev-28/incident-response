@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .config import Settings
 from .demo import build_unique_console_demo_alert
-from .models import Incident, IncidentStatus, Runbook
+from .models import Incident, IncidentStatus, RemediationStatus, Runbook
 from .orchestrator import IncidentOrchestrator
 from .queue import AlertQueue
 
@@ -372,6 +372,74 @@ def _render_resolution(incident: Incident) -> str:
     )
 
 
+def _render_remediation_approval(incident: Incident, settings: Settings) -> str:
+    remediation = incident.remediation
+    if remediation is None:
+        return ""
+
+    steps = "".join(
+        "<li>"
+        f"<strong>{escape(step.name)}</strong>"
+        f"<code>{escape(step.command)}</code>"
+        f'<span class="muted">runbook auto: {"yes" if step.auto else "no"}</span>'
+        "</li>"
+        for step in remediation.steps
+    )
+    decision = ""
+    if remediation.status == RemediationStatus.PENDING:
+        if _mock_console_writes_enabled(settings):
+            base = f"/console/incidents/{escape(incident.id)}/remediation"
+            decision = (
+                '<div class="approval-actions">'
+                f'<form method="post" action="{base}/approve">'
+                '<label for="approval-note">Decision note</label>'
+                '<textarea id="approval-note" name="note" maxlength="500" rows="2" '
+                'placeholder="Why is this safe to run?"></textarea>'
+                '<button type="submit" class="primary">Approve and run</button>'
+                "</form>"
+                f'<form method="post" action="{base}/reject">'
+                '<label for="rejection-note">Rejection reason</label>'
+                '<textarea id="rejection-note" name="note" maxlength="500" rows="2" '
+                'placeholder="Why should this not run?"></textarea>'
+                '<button type="submit" class="danger">Reject</button>'
+                "</form></div>"
+            )
+        else:
+            decision = (
+                '<p class="muted">Use the authenticated remediation API to approve '
+                "or reject this proposal.</p>"
+            )
+    else:
+        decided_by = escape(remediation.decided_by or "unknown operator")
+        decided_at = (
+            escape(remediation.decided_at.isoformat())
+            if remediation.decided_at is not None
+            else "unknown time"
+        )
+        decision = (
+            f'<p class="decision-result"><strong>{escape(remediation.status.value.title())}'
+            f"</strong> by {decided_by} at {decided_at}.</p>"
+        )
+        if remediation.note:
+            decision += f"<p>{escape(remediation.note)}</p>"
+        if remediation.execution_summary:
+            decision += f"<p>{escape(remediation.execution_summary)}</p>"
+
+    heading = (
+        "Approval required"
+        if remediation.status == RemediationStatus.PENDING
+        else "Remediation decision"
+    )
+    return (
+        '<section class="detail-section remediation-approval">'
+        f"<h2>{heading}</h2>"
+        f"<p>Runbook <code>{escape(remediation.runbook_slug)}</code> proposes "
+        f"{len(remediation.steps)} action(s).</p>"
+        f'<ol class="remediation-steps">{steps}</ol>'
+        f"{decision}</section>"
+    )
+
+
 def _render_resolve_action(incident: Incident, settings: Settings) -> str:
     if (
         not _mock_console_writes_enabled(settings)
@@ -407,6 +475,7 @@ def _render_incident_detail(incident: Incident, settings: Settings) -> str:
         + refresh_status
         + _render_alert_detail(incident)
         + _render_triage_detail(incident)
+        + _render_remediation_approval(incident, settings)
         + _render_timeline(incident)
         + _render_resolve_action(incident, settings)
         + _render_resolution(incident)
@@ -532,6 +601,56 @@ async def _resolution_note(request: Request) -> tuple[str | None, HTMLResponse |
         return None, HTMLResponse(
             content=_render_console_error(
                 "Resolution note too long",
+                f"Use {_MAX_RESOLUTION_NOTE_CHARS} characters or fewer.",
+            ),
+            status_code=422,
+        )
+    return note, None
+
+
+async def _remediation_note(request: Request) -> tuple[str | None, HTMLResponse | None]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded":
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Expected form data",
+                "Submit the decision from the incident detail form.",
+            ),
+            status_code=415,
+        )
+    body = await request.body()
+    if len(body) > _MAX_RESOLUTION_BODY_BYTES:
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Decision note too large",
+                f"Use {_MAX_RESOLUTION_NOTE_CHARS} characters or fewer.",
+            ),
+            status_code=413,
+        )
+    try:
+        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+    except UnicodeDecodeError:
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Invalid decision note",
+                "The decision note must be UTF-8 text.",
+            ),
+            status_code=422,
+        )
+    values = fields.get("note", [""])
+    if len(values) != 1:
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Invalid decision note",
+                "Submit exactly one decision note.",
+            ),
+            status_code=422,
+        )
+    note = values[0].strip()
+    if len(note) > _MAX_RESOLUTION_NOTE_CHARS:
+        return None, HTMLResponse(
+            content=_render_console_error(
+                "Decision note too long",
                 f"Use {_MAX_RESOLUTION_NOTE_CHARS} characters or fewer.",
             ),
             status_code=422,
@@ -683,3 +802,88 @@ def register_console(
                 status_code=500,
             )
         return RedirectResponse(url=f"/console/incidents/{incident_id}", status_code=303)
+
+    async def decide_console_remediation(
+        incident_id: str,
+        request: Request,
+        *,
+        approve: bool,
+    ) -> Response:
+        if not _mock_console_writes_enabled(settings):
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Console writes unavailable",
+                    "Use the authenticated remediation API unless every integration "
+                    "and remediation mode is set to mock.",
+                ),
+                status_code=403,
+            )
+        if _is_cross_site(request):
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Cross-site request rejected",
+                    "Open the local console directly before deciding remediation.",
+                ),
+                status_code=403,
+            )
+        note, error = await _remediation_note(request)
+        if error is not None:
+            return error
+        try:
+            if approve:
+                await orchestrator.approve_remediation(
+                    incident_id,
+                    decided_by="local-console",
+                    note=note or "",
+                )
+            else:
+                await orchestrator.reject_remediation(
+                    incident_id,
+                    decided_by="local-console",
+                    note=note or "",
+                )
+        except LookupError:
+            return HTMLResponse(content=_render_not_found(incident_id), status_code=404)
+        except ValueError as exc:
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Remediation decision unavailable",
+                    str(exc),
+                ),
+                status_code=409,
+            )
+        except Exception:
+            logger.exception(
+                "console_remediation_decision_failed",
+                extra={"incident_id": incident_id, "approve": approve},
+            )
+            return HTMLResponse(
+                content=_render_console_error(
+                    "Could not decide remediation",
+                    "The decision was not completed. Check the server logs and try again.",
+                ),
+                status_code=500,
+            )
+        return RedirectResponse(url=f"/console/incidents/{incident_id}", status_code=303)
+
+    @app.post("/console/incidents/{incident_id}/remediation/approve")
+    async def console_approve_remediation(
+        incident_id: str,
+        request: Request,
+    ) -> Response:
+        return await decide_console_remediation(
+            incident_id,
+            request,
+            approve=True,
+        )
+
+    @app.post("/console/incidents/{incident_id}/remediation/reject")
+    async def console_reject_remediation(
+        incident_id: str,
+        request: Request,
+    ) -> Response:
+        return await decide_console_remediation(
+            incident_id,
+            request,
+            approve=False,
+        )

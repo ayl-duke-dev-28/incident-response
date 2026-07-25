@@ -15,7 +15,8 @@ Anthropic, GitHub, Slack, and Datadog.
 - Triage recent commits, match the best runbook, and estimate user impact in parallel.
 - Stream a Slack incident brief as each agent finishes.
 - Annotate the suspect PR when confidence clears the configured floor.
-- Dry-run or execute allow-listed runbook actions.
+- Review, approve, or reject persisted runbook actions before any executor runs.
+- Dry-run or execute approved, allow-listed runbook actions.
 - Verify whether remediation actually reduced the error rate.
 - Persist incident state to SQLite after every major step.
 - List recent incidents without knowing an incident ID.
@@ -125,6 +126,28 @@ Fetch the incident after triage finishes:
 curl http://localhost:8080/incidents/inc-ddg-9273
 ```
 
+If the matched runbook proposes actions, the incident contains a `remediation`
+object with `status: "pending"` and the exact commands awaiting review. Approve
+that immutable proposal through the authenticated API:
+
+```bash
+curl -X POST \
+  http://localhost:8080/alerts/inc-ddg-9273/remediation/approve \
+  -H "x-webhook-token: change-me" \
+  -H "content-type: application/json" \
+  -d '{"decided_by":"alice@example.com","note":"Approved by primary on-call"}'
+```
+
+Or reject it without invoking the executor:
+
+```bash
+curl -X POST \
+  http://localhost:8080/alerts/inc-ddg-9273/remediation/reject \
+  -H "x-webhook-token: change-me" \
+  -H "content-type: application/json" \
+  -d '{"decided_by":"incident-commander","note":"Use manual failover instead"}'
+```
+
 List recent incidents:
 
 ```bash
@@ -179,6 +202,7 @@ Select an incident title to open `/console/incidents/{id}`. The detail page show
 
 - alert description, service, metric, threshold, current value, and tags;
 - triage summary, estimated impact, matched runbook, and suspect commits;
+- the exact remediation commands awaiting approval and their decision history;
 - the remediation and resolution timeline;
 - verification results and the generated post-mortem path when available.
 
@@ -193,6 +217,11 @@ do not refresh automatically. Once triage finishes in all-mock mode, the detail
 page shows a **Resolve incident** form. Submit an optional note of up to 500
 characters to mark the incident resolved, generate its post-mortem, and return to
 the updated detail page. Unknown incident IDs return a navigable HTML `404` page.
+
+When a runbook proposes remediation, the all-mock console shows **Approve and
+run** and **Reject** controls with an optional 500-character decision note. The
+decision is persisted before execution, is final, and remains visible after a
+reload. In real integration modes, use the authenticated approval API.
 
 The demo button is shown only when LLM, GitHub, Slack, metrics, and remediation
 modes are all `mock`. It is hidden and `POST /console/demo-alert` returns `403` if
@@ -213,6 +242,7 @@ What works today:
 | `GET /console/runbooks/{slug}` runbook preview | Working. Shows escaped Markdown for an already-loaded runbook and returns an HTML `404` for unknown slugs. |
 | `GET /static/console.css` | Working. |
 | `POST /console/demo-alert` demo action | Working in all-mock mode. Enqueues a unique demo incident and redirects to its detail page. Hidden and forbidden when any integration or remediation mode is not `mock`. |
+| Console remediation approval | Working in all-mock mode. Shows the persisted command proposal and allows one final approve or reject decision. |
 | `POST /console/incidents/{id}/resolve` resolve action | Working in all-mock mode after triage completes. Accepts a form-encoded resolution note, generates a post-mortem, and redirects to the resolved detail page. |
 
 The refresh behavior has integration coverage for pending, completed, and
@@ -257,6 +287,8 @@ Useful demo flags:
 | `POST` | `/alerts` | Enqueue an incident. Returns `202 {status, incident_id}`. |
 | `GET` | `/incidents` | List recent incidents, newest first. Supports `status` and `limit` query params. |
 | `GET` | `/incidents/{id}` | Fetch current incident state. |
+| `POST` | `/alerts/{id}/remediation/approve` | Approve and execute the persisted proposal. Requires webhook authentication and `decided_by`; accepts an optional note. |
+| `POST` | `/alerts/{id}/remediation/reject` | Permanently reject the persisted proposal without execution. Requires webhook authentication and `decided_by`; accepts an optional note. |
 | `POST` | `/alerts/{id}/resolve` | Mark resolved and generate a post-mortem. |
 | `GET` | `/healthz` | Liveness check. |
 | `GET` | `/readyz` | Liveness plus queue depth. |
@@ -264,6 +296,8 @@ Useful demo flags:
 | `GET` | `/console/incidents/{id}` | Operator incident detail. Returns HTML, including an HTML `404` for unknown IDs. Unauthenticated. |
 | `GET` | `/console/runbooks/{slug}` | Preview an already-loaded runbook as escaped Markdown. Returns an HTML `404` for unknown slugs. Unauthenticated. |
 | `POST` | `/console/demo-alert` | Enqueue a unique checkout demo and redirect to its detail page. Available only when all integrations and remediation use `mock`. |
+| `POST` | `/console/incidents/{id}/remediation/approve` | Approve the persisted proposal and run the mock executor. All-mock and same-origin only. |
+| `POST` | `/console/incidents/{id}/remediation/reject` | Reject the persisted proposal without execution. All-mock and same-origin only. |
 | `POST` | `/console/incidents/{id}/resolve` | Resolve a triaged incident from the console and redirect to its detail page. Accepts form data with an optional `resolution_note` of at most 500 characters. Available only in all-mock mode. |
 | `GET` | `/static/console.css` | Console stylesheet. |
 
@@ -395,9 +429,11 @@ DATADOG_APP_KEY=...
    - User impact estimate.
 8. The Slack brief is updated as partial results arrive.
 9. The top suspect PR is annotated when confidence is high enough.
-10. Matched runbook actions are dry-run by default, or executed in shell mode if explicitly allowed.
-11. Verification polls metrics after executed remediation.
-12. `POST /alerts/{id}/resolve` marks the incident resolved and writes a post-mortem.
+10. Matched runbook actions are persisted as an immutable approval proposal.
+11. An authenticated operator approves or rejects the proposal.
+12. Approved actions are dry-run by default, or executed in shell mode if explicitly allowed.
+13. Verification polls metrics after executed remediation.
+14. `POST /alerts/{id}/resolve` marks the incident resolved and writes a post-mortem.
 
 ## Runbooks
 
@@ -432,6 +468,9 @@ tags: [checkout, http_5xx]
 
 Execution rules:
 
+- No runbook action reaches an executor until an operator approves it.
+- Approval executes the exact persisted proposal, even if the runbook changes later.
+- Approval or rejection is final; duplicate decisions return `409 Conflict`.
 - `REMEDIATION_MODE=mock` never touches the system. It returns `dry_run`.
 - `REMEDIATION_MODE=shell` only considers steps with `"auto": true`.
 - Shell mode only runs commands whose first token is in `REMEDIATION_ALLOWED_COMMANDS`.
@@ -445,6 +484,7 @@ The default configuration is intentionally non-destructive:
 - Mock integrations are the default for GitHub, Slack, metrics, and remediation.
 - `LLM_MODE=mock` provides a full offline path.
 - `REMEDIATION_MODE=mock` dry-runs every automated action.
+- Every remediation proposal requires an authenticated, persisted approval.
 - Shell remediation requires both `"auto": true` in the runbook and an allow-listed command prefix.
 - PR annotation failures are logged but never block incident handling.
 - Post-mortem generation falls back to a deterministic template if the LLM output is invalid.
@@ -455,7 +495,8 @@ Important production caveats:
 - The worker queue is in memory. A hard kill can lose queued but unprocessed alerts.
 - Rate limit and dedup state are in memory. Use Redis or similar storage for multiple instances.
 - Real LLM mode makes three calls per incident plus one post-mortem call on resolve.
-- Human approval for remediation is not implemented yet.
+- Approval coordination uses an in-process lock. Multi-instance deployments need
+  a database compare-and-swap or distributed lock before enabling shell execution.
 
 ## Storage And History
 
@@ -469,6 +510,7 @@ contains:
 - post-mortem path
 - timeline events
 - verification outcome
+- remediation proposal, operator decision, and execution summary
 
 The API can return recent incidents with `GET /incidents`, ordered by newest
 `created_at` first. That endpoint is the read model intended for local consoles
@@ -499,7 +541,7 @@ pytest
 Current suite:
 
 ```text
-149 passed, no network required
+155 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -590,11 +632,14 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 - No incident merging across services.
 - No on-call rotation lookup.
 - No Jira or Linear ticket creation.
-- No human approval workflow for shell remediation.
+- Remediation approval is persisted, but decision serialization is currently
+  process-local. Do not run multiple shell-enabled instances until decisions use
+  a database compare-and-swap or distributed lock.
 - No provider-specific alert normalization beyond the shared alert schema.
-- The console is local-first and has no authentication, RBAC, or approval gates. It
+- The console is local-first and has no authentication or RBAC. It
   exposes full incident detail to anyone who can reach the port. Console writes
-  are restricted to demo creation and incident resolution in all-mock mode;
+  are restricted to demo creation, mock remediation decisions, and incident
+  resolution in all-mock mode;
   real-integration resolution and remediation controls remain outside the console.
   The CLI defaults to `0.0.0.0`, so pass `--host 127.0.0.1` unless you have placed
   the service behind appropriate network and authentication controls.
