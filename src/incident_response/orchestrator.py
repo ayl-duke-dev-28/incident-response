@@ -94,7 +94,6 @@ class IncidentOrchestrator:
         self._config = config
         self._dedup = dedup or DedupIndex()
         self._executor = executor or MockExecutor()
-        self._remediation_lock = asyncio.Lock()
         self._runbooks: list[Runbook] = load_runbooks(config.runbooks_dir)
         self._history = PostmortemHistory.load(config.postmortem_dir)
 
@@ -349,93 +348,68 @@ class IncidentOrchestrator:
         decided_by: str,
         note: str = "",
     ) -> Incident:
-        """Persist approval before executing, making retries safe."""
+        """Atomically persist approval before executing, making retries safe."""
 
-        async with self._remediation_lock:
-            incident = self._pending_remediation(incident_id)
-            now = datetime.now(timezone.utc)
-            approved = incident.remediation.model_copy(
-                update={
-                    "status": RemediationStatus.APPROVED,
-                    "decided_at": now,
-                    "decided_by": decided_by,
-                    "note": note,
-                }
-            )
-            incident = incident.model_copy(
-                update={
-                    "remediation": approved,
-                    "timeline": incident.timeline
-                    + [
-                        {
-                            "timestamp": now.isoformat(),
-                            "event": (
-                                f"Remediation approved by {decided_by}."
-                                f"{f' {note}' if note else ''}"
-                            ),
-                        }
-                    ],
-                }
-            )
-            self._store.save(incident)
+        set_incident_id(incident_id)
+        incident = self._store.decide_remediation(
+            incident_id,
+            decision=RemediationStatus.APPROVED,
+            decided_at=datetime.now(timezone.utc),
+            decided_by=decided_by,
+            note=note,
+        )
+        approved = incident.remediation
+        assert approved is not None
 
-            baseline_series: MetricSeries | None = None
-            if self._config.verification_enabled:
-                try:
-                    baseline_series = await self._metrics.error_rate(
-                        incident.alert.service,
-                        minutes=_IMPACT_WINDOW_MINUTES,
-                    )
-                except Exception:
-                    logger.exception(
-                        "remediation_verification_baseline_failed",
-                        extra={"incident_id": incident_id},
-                    )
-
+        baseline_series: MetricSeries | None = None
+        if self._config.verification_enabled:
             try:
-                summary, executed_any = await self._run_remediation(
-                    approved.steps,
-                    incident.slack_message_ts,
+                baseline_series = await self._metrics.error_rate(
+                    incident.alert.service,
+                    minutes=_IMPACT_WINDOW_MINUTES,
                 )
             except Exception:
-                self._fail_remediation(incident, "Remediation executor failed")
-                raise
-
-            completed_at = datetime.now(timezone.utc)
-            completed = approved.model_copy(
-                update={
-                    "status": RemediationStatus.COMPLETED,
-                    "execution_summary": summary or "No remediation steps were executed.",
-                }
-            )
-            incident = incident.model_copy(
-                update={
-                    "remediation": completed,
-                    "timeline": incident.timeline
-                    + [
-                        {
-                            "timestamp": completed_at.isoformat(),
-                            "event": summary or "Remediation completed with no executable steps.",
-                        }
-                    ],
-                }
-            )
-            self._store.save(incident)
-
-            if (
-                executed_any
-                and self._config.verification_enabled
-                and baseline_series is not None
-                and incident.slack_message_ts
-            ):
-                self._schedule_verification(
-                    incident.id,
-                    incident.alert,
-                    baseline_series,
-                    incident.slack_message_ts,
-                    approved.runbook_slug,
+                logger.exception(
+                    "remediation_verification_baseline_failed",
+                    extra={"incident_id": incident_id},
                 )
-            return incident
+
+        try:
+            summary, executed_any = await self._run_remediation(
+                approved.steps,
+                incident.slack_message_ts,
+            )
+        except Exception:
+            self._store.finish_remediation(
+                incident_id,
+                status=RemediationStatus.FAILED,
+                summary="Remediation executor failed",
+                finished_at=datetime.now(timezone.utc),
+            )
+            raise
+
+        completion_summary = summary or "Remediation completed with no executable steps."
+        incident = self._store.finish_remediation(
+            incident_id,
+            status=RemediationStatus.COMPLETED,
+            summary=completion_summary,
+            finished_at=datetime.now(timezone.utc),
+        )
+
+        if (
+            executed_any
+            and self._config.verification_enabled
+            and baseline_series is not None
+            and incident.slack_message_ts
+        ):
+            self._schedule_verification(
+                incident.id,
+                incident.alert,
+                baseline_series,
+                incident.slack_message_ts,
+                approved.runbook_slug,
+            )
+        return incident
 
     async def reject_remediation(
         self,
@@ -444,71 +418,27 @@ class IncidentOrchestrator:
         decided_by: str,
         note: str = "",
     ) -> Incident:
-        """Reject a pending proposal permanently without invoking the executor."""
+        """Atomically reject a proposal without invoking the executor."""
 
-        async with self._remediation_lock:
-            incident = self._pending_remediation(incident_id)
-            now = datetime.now(timezone.utc)
-            rejected = incident.remediation.model_copy(
-                update={
-                    "status": RemediationStatus.REJECTED,
-                    "decided_at": now,
-                    "decided_by": decided_by,
-                    "note": note,
-                }
-            )
-            event = f"Remediation rejected by {decided_by}."
-            if note:
-                event += f" {note}"
-            incident = incident.model_copy(
-                update={
-                    "remediation": rejected,
-                    "timeline": incident.timeline
-                    + [{"timestamp": now.isoformat(), "event": event}],
-                }
-            )
-            self._store.save(incident)
-            if incident.slack_message_ts:
-                await self._slack.post(
-                    channel=self._config.slack_channel,
-                    text=f":no_entry: {event}",
-                    thread_ts=incident.slack_message_ts,
-                )
-            return incident
-
-    def _pending_remediation(self, incident_id: str) -> Incident:
         set_incident_id(incident_id)
-        incident = self._store.get(incident_id)
-        if incident is None:
-            raise LookupError(f"Unknown incident: {incident_id}")
-        if incident.status == IncidentStatus.RESOLVED:
-            raise ValueError("Cannot decide remediation for a resolved incident")
-        remediation = incident.remediation
-        if remediation is None:
-            raise ValueError("Incident has no remediation awaiting approval")
-        if remediation.status != RemediationStatus.PENDING:
-            raise ValueError(
-                f"Remediation already decided: {remediation.status.value}"
+        decided_at = datetime.now(timezone.utc)
+        incident = self._store.decide_remediation(
+            incident_id,
+            decision=RemediationStatus.REJECTED,
+            decided_at=decided_at,
+            decided_by=decided_by,
+            note=note,
+        )
+        event = f"Remediation rejected by {decided_by}."
+        if note:
+            event += f" {note}"
+        if incident.slack_message_ts:
+            await self._slack.post(
+                channel=self._config.slack_channel,
+                text=f":no_entry: {event}",
+                thread_ts=incident.slack_message_ts,
             )
         return incident
-
-    def _fail_remediation(self, incident: Incident, summary: str) -> Incident:
-        now = datetime.now(timezone.utc)
-        failed = incident.remediation.model_copy(
-            update={
-                "status": RemediationStatus.FAILED,
-                "execution_summary": summary,
-            }
-        )
-        failed_incident = incident.model_copy(
-            update={
-                "remediation": failed,
-                "timeline": incident.timeline
-                + [{"timestamp": now.isoformat(), "event": summary}],
-            }
-        )
-        self._store.save(failed_incident)
-        return failed_incident
 
     async def _maybe_annotate_pr(self, incident: Incident, triage: TriageReport) -> None:
         """Post an incident-context comment on the suspect commit's PR when the
