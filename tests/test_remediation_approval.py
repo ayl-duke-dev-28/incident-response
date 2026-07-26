@@ -1,5 +1,8 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
@@ -200,6 +203,129 @@ async def test_approval_executes_the_persisted_proposal_if_runbook_changes(
     )
 
     assert [step.command for step in executor.calls[0]] == approved_commands
+
+
+def test_two_orchestrators_cannot_approve_and_execute_the_same_proposal(
+    alert, tmp_db, postmortem_dir, runbooks_dir
+):
+    first_executor = RecordingExecutor()
+    second_executor = RecordingExecutor()
+    first, _, first_store = _build_orchestrator(
+        tmp_db=tmp_db,
+        postmortem_dir=postmortem_dir,
+        runbooks_dir=runbooks_dir,
+        executor=first_executor,
+    )
+    second, _, second_store = _build_orchestrator(
+        tmp_db=tmp_db,
+        postmortem_dir=postmortem_dir,
+        runbooks_dir=runbooks_dir,
+        executor=second_executor,
+    )
+    incident = asyncio.run(first.handle_alert(alert))
+
+    # Force both process-local orchestrators to observe the pending state before
+    # either writes. A database-backed claim must still allow only one winner.
+    read_barrier = Barrier(2)
+
+    def synchronize_pending_read(store: IncidentStore) -> None:
+        original_get = store.get
+
+        def get_after_barrier(incident_id: str):
+            current = original_get(incident_id)
+            if (
+                current is not None
+                and current.remediation is not None
+                and current.remediation.status.value == "pending"
+            ):
+                read_barrier.wait(timeout=5)
+            return current
+
+        store.get = get_after_barrier
+
+    synchronize_pending_read(first_store)
+    synchronize_pending_read(second_store)
+
+    def approve(orchestrator: IncidentOrchestrator, actor: str):
+        return asyncio.run(
+            orchestrator.approve_remediation(
+                incident.id,
+                decided_by=actor,
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(approve, first, "first-instance"),
+            pool.submit(approve, second, "second-instance"),
+        ]
+        outcomes = []
+        for future in futures:
+            try:
+                outcomes.append(future.result(timeout=10))
+            except Exception as exc:
+                outcomes.append(exc)
+
+    successes = [outcome for outcome in outcomes if isinstance(outcome, Incident)]
+    conflicts = [outcome for outcome in outcomes if isinstance(outcome, ValueError)]
+    assert len(successes) == 1
+    assert len(conflicts) == 1
+    assert "already" in str(conflicts[0])
+    assert len(first_executor.calls) + len(second_executor.calls) == 1
+
+    persisted = IncidentStore(tmp_db).get(incident.id)
+    assert persisted is not None
+    assert persisted.remediation.status.value == "completed"
+    assert persisted.remediation.decided_by in {"first-instance", "second-instance"}
+
+
+async def test_execution_completion_preserves_concurrent_incident_updates(
+    alert, tmp_db, postmortem_dir, runbooks_dir
+):
+    executor = RecordingExecutor()
+    orchestrator, _, store = _build_orchestrator(
+        tmp_db=tmp_db,
+        postmortem_dir=postmortem_dir,
+        runbooks_dir=runbooks_dir,
+        executor=executor,
+    )
+    incident = await orchestrator.handle_alert(alert)
+    original_run = executor.run
+
+    async def resolve_while_executing(steps):
+        current = store.get(incident.id)
+        resolved_at = datetime.now(timezone.utc)
+        store.save(
+            current.model_copy(
+                update={
+                    "status": IncidentStatus.RESOLVED,
+                    "resolved_at": resolved_at,
+                    "timeline": current.timeline
+                    + [
+                        {
+                            "timestamp": resolved_at.isoformat(),
+                            "event": "Resolved concurrently by another instance.",
+                        }
+                    ],
+                }
+            )
+        )
+        return await original_run(steps)
+
+    executor.run = resolve_while_executing
+
+    await orchestrator.approve_remediation(
+        incident.id,
+        decided_by="approver",
+    )
+
+    persisted = store.get(incident.id)
+    assert persisted.status == IncidentStatus.RESOLVED
+    assert persisted.remediation.status.value == "completed"
+    assert any(
+        event["event"] == "Resolved concurrently by another instance."
+        for event in persisted.timeline
+    )
 
 
 def _settings(tmp_path: Path, runbooks_dir: Path) -> Settings:
