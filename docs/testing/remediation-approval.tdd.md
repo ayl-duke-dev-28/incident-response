@@ -80,11 +80,9 @@ TOTAL 1993 statements, 242 missed, 88% coverage
 
 ## Coverage and known gaps
 
-Coverage remains above the required 80% threshold. The approval lock is
-process-local. A shell-enabled multi-instance deployment still needs an atomic
-database transition or distributed lock to guarantee global at-most-once
-execution. The coverage run also surfaces existing Python 3.14 SQLite resource
-warnings in webhook tests; they predate this feature and do not fail the suite.
+Coverage remains above the required 80% threshold. At the time of this feature,
+the approval lock was process-local. That gap was closed by the follow-up
+[atomic approval evidence](remediation-approval-atomicity.tdd.md).
 
 ## Merge evidence
 

@@ -471,6 +471,8 @@ Execution rules:
 - No runbook action reaches an executor until an operator approves it.
 - Approval executes the exact persisted proposal, even if the runbook changes later.
 - Approval or rejection is final; duplicate decisions return `409 Conflict`.
+- SQLite serializes the pending-to-decided transition, so processes sharing the
+  same database cannot both execute one proposal.
 - `REMEDIATION_MODE=mock` never touches the system. It returns `dry_run`.
 - `REMEDIATION_MODE=shell` only considers steps with `"auto": true`.
 - Shell mode only runs commands whose first token is in `REMEDIATION_ALLOWED_COMMANDS`.
@@ -495,8 +497,9 @@ Important production caveats:
 - The worker queue is in memory. A hard kill can lose queued but unprocessed alerts.
 - Rate limit and dedup state are in memory. Use Redis or similar storage for multiple instances.
 - Real LLM mode makes three calls per incident plus one post-mortem call on resolve.
-- Approval coordination uses an in-process lock. Multi-instance deployments need
-  a database compare-and-swap or distributed lock before enabling shell execution.
+- Approval and execution completion use atomic SQLite transactions. Concurrent
+  processes sharing the same database produce one decision winner, and completion
+  preserves incident changes written by another process.
 
 ## Storage And History
 
@@ -541,7 +544,7 @@ pytest
 Current suite:
 
 ```text
-155 passed, no network required
+157 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -632,9 +635,6 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 - No incident merging across services.
 - No on-call rotation lookup.
 - No Jira or Linear ticket creation.
-- Remediation approval is persisted, but decision serialization is currently
-  process-local. Do not run multiple shell-enabled instances until decisions use
-  a database compare-and-swap or distributed lock.
 - No provider-specific alert normalization beyond the shared alert schema.
 - The console is local-first and has no authentication or RBAC. It
   exposes full incident detail to anyone who can reach the port. Console writes
