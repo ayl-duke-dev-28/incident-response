@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+from contextlib import closing
 
 from incident_response.models import Alert, Severity
 from incident_response.queue import AlertQueue
@@ -155,7 +156,7 @@ async def test_retry_schedule_and_attempt_count_survive_restart(tmp_path):
     await asyncio.wait_for(first_attempted.wait(), timeout=1)
     await first.stop()
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
             """
             SELECT attempt_count, next_attempt_at, last_error
@@ -205,7 +206,7 @@ async def test_durable_queue_coalesces_duplicate_pending_alert_ids(tmp_path):
 
 def test_durable_queue_migrates_slice_one_schema(tmp_path):
     db_path = tmp_path / "incidents.db"
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         conn.executescript(
             """
             CREATE TABLE alert_queue (
@@ -218,7 +219,7 @@ def test_durable_queue_migrates_slice_one_schema(tmp_path):
 
     AlertQueue(handler=lambda alert: None, db_path=db_path)
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn:
         columns = {
             row[1]
             for row in conn.execute("PRAGMA table_info(alert_queue)").fetchall()

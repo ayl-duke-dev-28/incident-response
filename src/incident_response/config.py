@@ -30,6 +30,10 @@ class Settings(BaseSettings):
     db_path: Path = Path("./incidents.db")
     webhook_token: str = "change-me"
 
+    # Durable alert queue retry schedule
+    queue_retry_base_seconds: float = 1.0
+    queue_retry_max_seconds: float = 60.0
+
     # HMAC signing secrets — optional per source
     datadog_webhook_secret: str = ""
     pagerduty_webhook_secret: str = ""

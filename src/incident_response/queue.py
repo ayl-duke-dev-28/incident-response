@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Awaitable, Callable, Iterator
@@ -26,11 +27,23 @@ _QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS alert_queue (
     alert_id TEXT PRIMARY KEY,
     payload TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    last_error TEXT
 );
 CREATE INDEX IF NOT EXISTS alert_queue_created_idx
 ON alert_queue(created_at, alert_id);
 """
+
+
+def _retry_delay(
+    attempt_number: int,
+    *,
+    base_seconds: float,
+    max_seconds: float,
+) -> float:
+    return min(max_seconds, base_seconds * (2 ** max(attempt_number - 1, 0)))
 
 
 class _DurableAlertStore:
@@ -39,6 +52,28 @@ class _DurableAlertStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
             conn.executescript(_QUEUE_SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(alert_queue)").fetchall()
+        }
+        migrations = {
+            "attempt_count": (
+                "ALTER TABLE alert_queue "
+                "ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            ),
+            "next_attempt_at": (
+                "ALTER TABLE alert_queue "
+                "ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
+            ),
+            "last_error": "ALTER TABLE alert_queue ADD COLUMN last_error TEXT",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                conn.execute(statement)
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -78,16 +113,56 @@ class _DurableAlertStore:
                 (alert_id,),
             )
 
-    def pending_ids(self) -> list[str]:
+    def pending_ids(self, now: float) -> list[str]:
         with self._conn() as conn:
             rows = conn.execute(
                 """
                 SELECT alert_id
                 FROM alert_queue
+                WHERE next_attempt_at <= ?
                 ORDER BY created_at ASC, alert_id ASC
-                """
+                """,
+                (now,),
             ).fetchall()
         return [str(row["alert_id"]) for row in rows]
+
+    def schedule_retry(
+        self,
+        alert_id: str,
+        *,
+        error: str,
+        base_seconds: float,
+        max_seconds: float,
+    ) -> None:
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT attempt_count FROM alert_queue WHERE alert_id = ?",
+                (alert_id,),
+            ).fetchone()
+            if row is None:
+                return
+            attempt_count = int(row["attempt_count"]) + 1
+            delay = _retry_delay(
+                attempt_count,
+                base_seconds=base_seconds,
+                max_seconds=max_seconds,
+            )
+            conn.execute(
+                """
+                UPDATE alert_queue
+                SET attempt_count = ?,
+                    next_attempt_at = ?,
+                    last_error = ?
+                WHERE alert_id = ?
+                """,
+                (
+                    attempt_count,
+                    time.time() + delay,
+                    error[:500],
+                    alert_id,
+                ),
+            )
 
     def count(self) -> int:
         with self._conn() as conn:
@@ -101,13 +176,22 @@ class AlertQueue:
         handler: AlertHandler,
         maxsize: int = 1000,
         db_path: Path | None = None,
+        retry_base_seconds: float = 1.0,
+        retry_max_seconds: float = 60.0,
     ) -> None:
+        if retry_base_seconds < 0:
+            raise ValueError("retry_base_seconds must be non-negative")
+        if retry_max_seconds < retry_base_seconds:
+            raise ValueError("retry_max_seconds must be at least retry_base_seconds")
         self._handler = handler
         self._queue: asyncio.Queue[Alert | str] = asyncio.Queue(maxsize=maxsize)
         self._store = _DurableAlertStore(db_path) if db_path is not None else None
+        self._retry_base_seconds = retry_base_seconds
+        self._retry_max_seconds = retry_max_seconds
         self._worker: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
-        self._attempted: set[str] = set()
+
+    _retry_delay = staticmethod(_retry_delay)
 
     async def submit(self, alert: Alert) -> None:
         if self._store is None:
@@ -119,7 +203,6 @@ class AlertQueue:
     def start(self) -> None:
         if self._worker is None or self._worker.done():
             self._stopping.clear()
-            self._attempted.clear()
             self._worker = asyncio.create_task(self._run(), name="incident-worker")
 
     async def stop(self) -> None:
@@ -158,10 +241,15 @@ class AlertQueue:
                     continue
             try:
                 await self._handler(alert)
-            except Exception:
+            except Exception as exc:
                 logger.exception("worker_handler_failed", extra={"alert_id": alert.id})
                 if alert_id is not None:
-                    self._attempted.add(alert_id)
+                    self._store.schedule_retry(
+                        alert_id,
+                        error=str(exc),
+                        base_seconds=self._retry_base_seconds,
+                        max_seconds=self._retry_max_seconds,
+                    )
             else:
                 if alert_id is not None:
                     self._store.delete(alert_id)
@@ -172,14 +260,7 @@ class AlertQueue:
     def _next_recovered_id(self) -> str | None:
         if self._store is None:
             return None
-        return next(
-            (
-                alert_id
-                for alert_id in self._store.pending_ids()
-                if alert_id not in self._attempted
-            ),
-            None,
-        )
+        return next(iter(self._store.pending_ids(time.time())), None)
 
     def qsize(self) -> int:
         if self._store is not None:
