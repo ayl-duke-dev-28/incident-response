@@ -130,7 +130,7 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
     setup_tracing(settings.otel_service_name)
 
     orchestrator = build_orchestrator(settings, llm=llm)
-    queue = AlertQueue(handler=orchestrator.handle_alert)
+    queue = AlertQueue(handler=orchestrator.handle_alert, db_path=settings.db_path)
     limiter = SlidingWindowRateLimiter(
         max_events=settings.rate_limit_max,
         window_seconds=settings.rate_limit_window_seconds,
