@@ -10,7 +10,9 @@ Anthropic, GitHub, Slack, and Datadog.
 
 - Receive Datadog, PagerDuty, or generic webhook alerts at `POST /alerts`.
 - Authenticate webhooks with a shared token or HMAC signatures.
-- Return `202 Accepted` quickly and process the incident in a background worker.
+- Persist accepted alerts to SQLite before returning `202`, then process them in
+  a background worker.
+- Recover unfinished alerts when the service restarts.
 - Deduplicate repeated alerts in a 15-minute service/metric/severity bucket.
 - Triage recent commits, match the best runbook, and estimate user impact in parallel.
 - Stream a Slack incident brief as each agent finishes.
@@ -421,7 +423,7 @@ DATADOG_APP_KEY=...
 2. Auth accepts either the shared token or one configured HMAC signature.
 3. The sliding-window rate limiter checks `(client_ip, service)`.
 4. Dedup fingerprints `(service, metric, severity, 15-minute bucket)`.
-5. The API returns `202` and submits the alert to the async worker.
+5. The API persists the alert to SQLite, returns `202`, and wakes the async worker.
 6. The orchestrator opens an incident and persists it to SQLite.
 7. Triage runs three agents in parallel:
    - Commit suspect ranking.
@@ -494,7 +496,11 @@ The default configuration is intentionally non-destructive:
 
 Important production caveats:
 
-- The worker queue is in memory. A hard kill can lose queued but unprocessed alerts.
+- Pending alerts survive process restarts in SQLite. This first durable slice
+  retries failed handling only after restart; timed retries, leases, attempt
+  counters, and dead-letter handling are not implemented yet.
+- Run one active queue worker per SQLite database. Cross-process job claiming is
+  a later queue milestone.
 - Rate limit and dedup state are in memory. Use Redis or similar storage for multiple instances.
 - Real LLM mode makes three calls per incident plus one post-mortem call on resolve.
 - Approval and execution completion use atomic SQLite transactions. Concurrent
@@ -544,7 +550,7 @@ pytest
 Current suite:
 
 ```text
-157 passed, no network required
+160 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -584,7 +590,7 @@ src/incident_response/
   models.py            Pydantic domain models
   db.py                SQLite persistence
   config.py            Env-driven settings
-  queue.py             In-process async worker
+  queue.py             SQLite-backed alert queue and async worker
   dedup.py             Alert fingerprinting and TTL LRU
   rate_limit.py        Sliding-window rate limiter
   security.py          Datadog, PagerDuty, and generic HMAC verification
@@ -630,7 +636,8 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 
 ## Current Limits
 
-- No durable queue yet.
+- The durable queue has restart recovery but not timed retries, attempt counters,
+  processing leases, dead-letter handling, or cross-process job claiming.
 - No Redis-backed rate limit or dedup for multi-instance deployments.
 - No incident merging across services.
 - No on-call rotation lookup.
