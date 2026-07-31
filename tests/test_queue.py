@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 
 from incident_response.models import Alert, Severity
 from incident_response.queue import AlertQueue
@@ -78,7 +79,7 @@ async def test_durable_queue_recovers_alert_submitted_before_worker_start(tmp_pa
     assert restarted.qsize() == 0
 
 
-async def test_durable_queue_removes_alert_only_after_success(tmp_path):
+async def test_durable_queue_retains_alert_after_failure(tmp_path):
     db_path = tmp_path / "incidents.db"
     attempts: list[str] = []
 
@@ -98,20 +99,97 @@ async def test_durable_queue_removes_alert_only_after_success(tmp_path):
     assert attempts == ["retry-after-restart"]
     assert first.qsize() == 1
 
+
+def test_retry_delay_is_exponential_and_capped():
+    assert AlertQueue._retry_delay(1, base_seconds=1, max_seconds=5) == 1
+    assert AlertQueue._retry_delay(2, base_seconds=1, max_seconds=5) == 2
+    assert AlertQueue._retry_delay(3, base_seconds=1, max_seconds=5) == 4
+    assert AlertQueue._retry_delay(4, base_seconds=1, max_seconds=5) == 5
+
+
+async def test_durable_queue_retries_automatically_after_persisted_backoff(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    attempts: list[float] = []
+
+    async def flaky_handler(alert: Alert) -> None:
+        attempts.append(asyncio.get_running_loop().time())
+        if len(attempts) < 3:
+            raise RuntimeError(f"temporary failure {len(attempts)}")
+
+    queue = AlertQueue(
+        handler=flaky_handler,
+        db_path=db_path,
+        retry_base_seconds=0.02,
+        retry_max_seconds=0.04,
+    )
+    queue.start()
+    await queue.submit(_alert("automatic-retry"))
+    for _ in range(100):
+        if len(attempts) == 3:
+            break
+        await asyncio.sleep(0.01)
+    await queue.stop()
+
+    assert len(attempts) == 3
+    assert attempts[1] - attempts[0] >= 0.015
+    assert attempts[2] - attempts[1] >= 0.03
+    assert queue.qsize() == 0
+
+
+async def test_retry_schedule_and_attempt_count_survive_restart(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    first_attempted = asyncio.Event()
+
+    async def failing_handler(alert: Alert) -> None:
+        first_attempted.set()
+        raise RuntimeError("database temporarily unavailable")
+
+    first = AlertQueue(
+        handler=failing_handler,
+        db_path=db_path,
+        retry_base_seconds=0.2,
+        retry_max_seconds=0.2,
+    )
+    first.start()
+    await first.submit(_alert("persisted-retry"))
+    await asyncio.wait_for(first_attempted.wait(), timeout=1)
+    await first.stop()
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT attempt_count, next_attempt_at, last_error
+            FROM alert_queue
+            WHERE alert_id = ?
+            """,
+            ("persisted-retry",),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 1
+    assert row[1] > 0
+    assert row[2] == "database temporarily unavailable"
+
     recovered: list[str] = []
 
     async def successful_handler(alert: Alert) -> None:
         recovered.append(alert.id)
 
-    restarted = AlertQueue(handler=successful_handler, db_path=db_path)
+    restarted = AlertQueue(
+        handler=successful_handler,
+        db_path=db_path,
+        retry_base_seconds=0.2,
+        retry_max_seconds=0.2,
+    )
     restarted.start()
-    for _ in range(100):
+    await asyncio.sleep(0.05)
+    assert recovered == []
+    for _ in range(50):
         if recovered:
             break
         await asyncio.sleep(0.01)
     await restarted.stop()
 
-    assert recovered == ["retry-after-restart"]
+    assert recovered == ["persisted-retry"]
     assert restarted.qsize() == 0
 
 
@@ -123,3 +201,26 @@ async def test_durable_queue_coalesces_duplicate_pending_alert_ids(tmp_path):
     await queue.submit(_alert("duplicate"))
 
     assert queue.qsize() == 1
+
+
+def test_durable_queue_migrates_slice_one_schema(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE alert_queue (
+                alert_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            """
+        )
+
+    AlertQueue(handler=lambda alert: None, db_path=db_path)
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(alert_queue)").fetchall()
+        }
+    assert {"attempt_count", "next_attempt_at", "last_error"} <= columns
