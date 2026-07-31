@@ -286,14 +286,14 @@ Useful demo flags:
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/alerts` | Enqueue an incident. Returns `202 {status, incident_id}`. |
+| `POST` | `/alerts` | Persist an alert, wake the worker, and return `202 {status, incident_id}`. |
 | `GET` | `/incidents` | List recent incidents, newest first. Supports `status` and `limit` query params. |
 | `GET` | `/incidents/{id}` | Fetch current incident state. |
 | `POST` | `/alerts/{id}/remediation/approve` | Approve and execute the persisted proposal. Requires webhook authentication and `decided_by`; accepts an optional note. |
 | `POST` | `/alerts/{id}/remediation/reject` | Permanently reject the persisted proposal without execution. Requires webhook authentication and `decided_by`; accepts an optional note. |
 | `POST` | `/alerts/{id}/resolve` | Mark resolved and generate a post-mortem. |
 | `GET` | `/healthz` | Liveness check. |
-| `GET` | `/readyz` | Liveness plus queue depth. |
+| `GET` | `/readyz` | Liveness plus the number of persisted unfinished alerts in `queue_depth`. |
 | `GET` | `/console` | Operator incident list. Returns HTML, not JSON. Unauthenticated. |
 | `GET` | `/console/incidents/{id}` | Operator incident detail. Returns HTML, including an HTML `404` for unknown IDs. Unauthenticated. |
 | `GET` | `/console/runbooks/{slug}` | Preview an already-loaded runbook as escaped Markdown. Returns an HTML `404` for unknown slugs. Unauthenticated. |
@@ -358,6 +358,39 @@ Authentication:
 
 Any one valid credential is enough.
 
+## Durable Alert Queue
+
+<!-- AUTO-GENERATED: durable queue behavior from src/incident_response/queue.py and main.py -->
+
+The FastAPI app stores queue rows in the same SQLite file configured by
+`DB_PATH`. `POST /alerts` completes that insert before returning `202 Accepted`.
+Each row contains the provider alert ID, serialized alert payload, and enqueue
+time.
+
+Queue lifecycle:
+
+1. `submit()` inserts the alert with `INSERT OR IGNORE`; one pending alert ID
+   occupies one row.
+2. The in-process worker wakes immediately for new submissions and polls SQLite
+   for unfinished rows after startup.
+3. Successful handling deletes the row.
+4. Failed handling logs the error and leaves the row persisted. That worker does
+   not retry the same row again during its current lifetime.
+5. Restarting the service clears the in-memory attempted set and recovers the
+   unfinished row.
+
+`GET /readyz` and the console queue indicator count persisted rows, including
+failed work awaiting restart recovery and work currently being handled but not
+yet completed. Direct `AlertQueue` users that omit `db_path` still get the
+original in-memory-only behavior; the FastAPI application always supplies
+`Settings.db_path`.
+
+This slice assumes one active queue worker per SQLite database. It does not yet
+provide scheduled retries, attempt counters, processing leases, dead-letter
+handling, or atomic cross-process job claims.
+
+<!-- END AUTO-GENERATED -->
+
 ## Configuration
 
 All runtime settings are loaded from environment variables or `.env`. The values
@@ -380,7 +413,7 @@ below are the defaults unless the row says a credential is required.
 | `DATADOG_APP_KEY` | empty | Datadog application key. |
 | `RUNBOOKS_DIR` | `./runbooks` | Markdown runbook library. |
 | `POSTMORTEM_DIR` | `./postmortems` | Generated post-mortems. |
-| `DB_PATH` | `./incidents.db` | SQLite incident store. |
+| `DB_PATH` | `./incidents.db` | Shared SQLite file for incidents and durable alert queue rows. |
 | `WEBHOOK_TOKEN` | `change-me` | Shared webhook token. |
 | `DATADOG_WEBHOOK_SECRET` | empty | Optional Datadog HMAC secret. |
 | `PAGERDUTY_WEBHOOK_SECRET` | empty | Optional PagerDuty HMAC secret. |
