@@ -58,10 +58,11 @@ TOTAL 2091 statements, 248 missed, 88% coverage
 
 ## Known gaps
 
-This slice attempts a failed row once per worker lifetime and recovers it on the
-next restart. It does not yet implement scheduled retry backoff, attempt counts,
-processing leases, dead-letter handling, or atomic cross-process job claims.
-Deploy one active queue worker per SQLite database until job claiming ships.
+At the time of this slice, failed rows recovered only after restart. Persisted
+timed retry and attempt counting shipped in
+[durable queue slice 2](durable-alert-queue-slice-2.tdd.md). Processing leases,
+dead-letter handling, maximum-attempt enforcement, and atomic cross-process job
+claims remain open.
 
 ## Merge evidence
 
