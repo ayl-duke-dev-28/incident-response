@@ -2,6 +2,8 @@ import asyncio
 import sqlite3
 from contextlib import closing
 
+import pytest
+
 from incident_response.models import Alert, Severity
 from incident_response.queue import AlertQueue
 
@@ -225,3 +227,97 @@ def test_durable_queue_migrates_slice_one_schema(tmp_path):
             for row in conn.execute("PRAGMA table_info(alert_queue)").fetchall()
         }
     assert {"attempt_count", "next_attempt_at", "last_error"} <= columns
+
+
+async def test_durable_queue_dead_letters_after_maximum_attempts(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    attempts: list[str] = []
+
+    async def permanently_failing_handler(alert: Alert) -> None:
+        attempts.append(alert.id)
+        raise RuntimeError("invalid alert payload")
+
+    queue = AlertQueue(
+        handler=permanently_failing_handler,
+        db_path=db_path,
+        retry_base_seconds=0,
+        retry_max_seconds=0,
+        max_attempts=3,
+    )
+    queue.start()
+    await queue.submit(_alert("poison-alert"))
+    for _ in range(100):
+        if queue.qsize() == 0:
+            break
+        await asyncio.sleep(0.01)
+    await queue.stop()
+
+    assert attempts == ["poison-alert"] * 3
+    assert queue.qsize() == 0
+    with closing(sqlite3.connect(db_path)) as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM alert_queue WHERE alert_id = ?",
+            ("poison-alert",),
+        ).fetchone()
+        dead_letter = conn.execute(
+            """
+            SELECT payload, attempt_count, last_error, failed_at
+            FROM alert_dead_letters
+            WHERE alert_id = ?
+            """,
+            ("poison-alert",),
+        ).fetchone()
+
+    assert pending == (0,)
+    assert dead_letter is not None
+    assert Alert.model_validate_json(dead_letter[0]).id == "poison-alert"
+    assert dead_letter[1] == 3
+    assert dead_letter[2] == "invalid alert payload"
+    assert dead_letter[3]
+
+
+def test_dead_letters_survive_queue_restart_and_stay_out_of_depth(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE alert_queue (
+                alert_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT
+            );
+            CREATE TABLE alert_dead_letters (
+                alert_id TEXT PRIMARY KEY,
+                payload TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL,
+                last_error TEXT NOT NULL,
+                failed_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO alert_dead_letters
+                (alert_id, payload, attempt_count, last_error)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("already-dead", _alert("already-dead").model_dump_json(), 5, "boom"),
+        )
+        conn.commit()
+
+    restarted = AlertQueue(handler=lambda alert: None, db_path=db_path)
+
+    assert restarted.qsize() == 0
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            "SELECT attempt_count, last_error FROM alert_dead_letters"
+        ).fetchone()
+    assert row == (5, "boom")
+
+
+def test_max_attempts_must_be_positive():
+    with pytest.raises(ValueError, match="max_attempts must be positive"):
+        AlertQueue(handler=lambda alert: None, max_attempts=0)
