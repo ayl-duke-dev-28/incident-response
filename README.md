@@ -13,7 +13,8 @@ Anthropic, GitHub, Slack, and Datadog.
 - Persist accepted alerts to SQLite before returning `202`, then process them in
   a background worker.
 - Recover unfinished alerts when the service restarts.
-- Retry failed alert handling automatically with persisted exponential backoff.
+- Retry failed alert handling automatically with persisted exponential backoff,
+  then dead-letter alerts that exhaust the configured attempt limit.
 - Deduplicate repeated alerts in a 15-minute service/metric/severity bucket.
 - Triage recent commits, match the best runbook, and estimate user impact in parallel.
 - Stream a Slack incident brief as each agent finishes.
@@ -379,17 +380,21 @@ Queue lifecycle:
    `last_error`, and schedules `next_attempt_at`.
 5. The delay is `base × 2^(attempt-1)`, capped by the configured maximum. The
    worker polls SQLite and retries the row when it becomes due.
-6. Restarting the service preserves both the attempt count and due time, so work
-   recovers without retrying earlier than scheduled.
+6. When `attempt_count` reaches `QUEUE_MAX_ATTEMPTS`, the same transaction copies
+   the payload, final error, attempt count, and failure timestamp into
+   `alert_dead_letters` and deletes the active queue row.
+7. Restarting the service preserves both scheduled retries and dead letters, so
+   work recovers without retrying earlier than scheduled.
 
 `GET /readyz` and the console queue indicator count persisted rows, including
-scheduled retries and work currently being handled but not yet completed. Direct
+scheduled retries and work currently being handled but not yet completed. Dead
+letters are excluded from this active depth and are not polled again. Direct
 `AlertQueue` users that omit `db_path` still get the original in-memory-only
 behavior; the FastAPI application always supplies `Settings.db_path`.
 
 This slice assumes one active queue worker per SQLite database. It does not yet
-provide processing leases, dead-letter handling, maximum-attempt enforcement, or
-atomic cross-process job claims.
+provide processing leases, operator APIs for listing or replaying dead letters,
+or atomic cross-process job claims.
 
 <!-- END AUTO-GENERATED -->
 
@@ -418,6 +423,7 @@ below are the defaults unless the row says a credential is required.
 | `DB_PATH` | `./incidents.db` | Shared SQLite file for incidents and durable alert queue rows. |
 | `QUEUE_RETRY_BASE_SECONDS` | `1` | Delay before the first automatic queue retry. |
 | `QUEUE_RETRY_MAX_SECONDS` | `60` | Maximum exponential queue retry delay. Must be at least the base delay. |
+| `QUEUE_MAX_ATTEMPTS` | `5` | Handler failures allowed before an alert is moved to `alert_dead_letters`. Must be positive. |
 | `WEBHOOK_TOKEN` | `change-me` | Shared webhook token. |
 | `DATADOG_WEBHOOK_SECRET` | empty | Optional Datadog HMAC secret. |
 | `PAGERDUTY_WEBHOOK_SECRET` | empty | Optional PagerDuty HMAC secret. |
@@ -535,7 +541,8 @@ Important production caveats:
 
 - Pending alerts survive process restarts in SQLite. Failures retry automatically
   with a persisted attempt count and exponential delay capped at 60 seconds by
-  default.
+  default. After five failures by default, the alert moves to durable dead-letter
+  storage and leaves active queue depth.
 - Run one active queue worker per SQLite database. Cross-process job claiming is
   a later queue milestone.
 - Rate limit and dedup state are in memory. Use Redis or similar storage for multiple instances.
@@ -673,9 +680,9 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 
 ## Current Limits
 
-- The durable queue has restart recovery and timed retries, but not processing
-  leases, maximum-attempt enforcement, dead-letter handling, or cross-process job
-  claiming.
+- The durable queue has restart recovery, timed retries, bounded attempts, and
+  durable dead-letter storage, but no processing leases, dead-letter listing or
+  replay API, or cross-process job claiming.
 - No Redis-backed rate limit or dedup for multi-instance deployments.
 - No incident merging across services.
 - No on-call rotation lookup.
