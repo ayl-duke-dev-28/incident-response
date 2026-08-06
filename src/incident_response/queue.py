@@ -34,6 +34,13 @@ CREATE TABLE IF NOT EXISTS alert_queue (
 );
 CREATE INDEX IF NOT EXISTS alert_queue_created_idx
 ON alert_queue(created_at, alert_id);
+CREATE TABLE IF NOT EXISTS alert_dead_letters (
+    alert_id TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    last_error TEXT NOT NULL,
+    failed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -126,23 +133,39 @@ class _DurableAlertStore:
             ).fetchall()
         return [str(row["alert_id"]) for row in rows]
 
-    def schedule_retry(
+    def record_failure(
         self,
         alert_id: str,
         *,
         error: str,
         base_seconds: float,
         max_seconds: float,
-    ) -> None:
+        max_attempts: int,
+    ) -> bool:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT attempt_count FROM alert_queue WHERE alert_id = ?",
+                "SELECT payload, attempt_count FROM alert_queue WHERE alert_id = ?",
                 (alert_id,),
             ).fetchone()
             if row is None:
-                return
+                return False
             attempt_count = int(row["attempt_count"]) + 1
+            truncated_error = error[:500]
+            if attempt_count >= max_attempts:
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO alert_dead_letters
+                        (alert_id, payload, attempt_count, last_error, failed_at)
+                    VALUES (?, ?, ?, ?, datetime('now'))
+                    """,
+                    (alert_id, row["payload"], attempt_count, truncated_error),
+                )
+                conn.execute(
+                    "DELETE FROM alert_queue WHERE alert_id = ?",
+                    (alert_id,),
+                )
+                return True
             delay = _retry_delay(
                 attempt_count,
                 base_seconds=base_seconds,
@@ -159,10 +182,11 @@ class _DurableAlertStore:
                 (
                     attempt_count,
                     time.time() + delay,
-                    error[:500],
+                    truncated_error,
                     alert_id,
                 ),
             )
+            return False
 
     def count(self) -> int:
         with self._conn() as conn:
@@ -178,16 +202,20 @@ class AlertQueue:
         db_path: Path | None = None,
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 60.0,
+        max_attempts: int = 5,
     ) -> None:
         if retry_base_seconds < 0:
             raise ValueError("retry_base_seconds must be non-negative")
         if retry_max_seconds < retry_base_seconds:
             raise ValueError("retry_max_seconds must be at least retry_base_seconds")
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
         self._handler = handler
         self._queue: asyncio.Queue[Alert | str] = asyncio.Queue(maxsize=maxsize)
         self._store = _DurableAlertStore(db_path) if db_path is not None else None
         self._retry_base_seconds = retry_base_seconds
         self._retry_max_seconds = retry_max_seconds
+        self._max_attempts = max_attempts
         self._worker: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
 
@@ -244,12 +272,21 @@ class AlertQueue:
             except Exception as exc:
                 logger.exception("worker_handler_failed", extra={"alert_id": alert.id})
                 if alert_id is not None:
-                    self._store.schedule_retry(
+                    dead_lettered = self._store.record_failure(
                         alert_id,
                         error=str(exc),
                         base_seconds=self._retry_base_seconds,
                         max_seconds=self._retry_max_seconds,
+                        max_attempts=self._max_attempts,
                     )
+                    if dead_lettered:
+                        logger.error(
+                            "alert_dead_lettered",
+                            extra={
+                                "alert_id": alert.id,
+                                "max_attempts": self._max_attempts,
+                            },
+                        )
             else:
                 if alert_id is not None:
                     self._store.delete(alert_id)
