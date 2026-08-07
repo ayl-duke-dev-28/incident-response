@@ -1,6 +1,7 @@
 import sqlite3
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 from fastapi.testclient import TestClient
 
@@ -154,3 +155,122 @@ def test_list_dead_letters_rejects_out_of_range_limit(tmp_path, runbooks_dir):
 
     assert too_small.status_code == 422
     assert too_large.status_code == 422
+
+
+def test_replay_dead_letter_requires_authentication(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir), llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.post("/dead-letters/missing/replay")
+
+    assert response.status_code == 401
+
+
+def test_replay_dead_letter_returns_not_found(tmp_path, runbooks_dir):
+    app = create_app(settings=_settings(tmp_path, runbooks_dir), llm=FakeLLM([]))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/dead-letters/missing/replay",
+            headers={"x-webhook-token": "secret"},
+        )
+
+    assert response.status_code == 404
+
+
+def test_replay_dead_letter_conflict_preserves_both_rows(tmp_path, runbooks_dir):
+    settings = _settings(tmp_path, runbooks_dir)
+    app = create_app(settings=settings, llm=FakeLLM([]))
+    _seed_dead_letter(
+        settings.db_path,
+        alert_id="already-active",
+        attempt_count=5,
+        last_error="permanent failure",
+        failed_at="2026-08-07 12:00:00",
+    )
+    with closing(sqlite3.connect(settings.db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO alert_queue
+                (alert_id, payload, attempt_count, next_attempt_at, last_error)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "already-active",
+                _alert("already-active").model_dump_json(),
+                2,
+                123.0,
+                "temporary failure",
+            ),
+        )
+        conn.commit()
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/dead-letters/already-active/replay",
+            headers={"x-webhook-token": "secret"},
+        )
+
+    assert response.status_code == 409
+    with closing(sqlite3.connect(settings.db_path)) as conn:
+        active = conn.execute(
+            """
+            SELECT attempt_count, next_attempt_at, last_error
+            FROM alert_queue
+            WHERE alert_id = ?
+            """,
+            ("already-active",),
+        ).fetchone()
+        dead = conn.execute(
+            "SELECT attempt_count, last_error FROM alert_dead_letters WHERE alert_id = ?",
+            ("already-active",),
+        ).fetchone()
+    assert active == (2, 123.0, "temporary failure")
+    assert dead == (5, "permanent failure")
+
+
+def test_replay_dead_letter_returns_accepted_and_prepares_orchestrator(
+    tmp_path, runbooks_dir
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    app = create_app(settings=settings, llm=FakeLLM([]))
+    app.state.queue.start = Mock()
+    app.state.queue.stop = AsyncMock()
+    app.state.orchestrator.prepare_replay = Mock()
+    _seed_dead_letter(
+        settings.db_path,
+        alert_id="replay-me",
+        attempt_count=5,
+        last_error="permanent failure",
+        failed_at="2026-08-07 12:00:00",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/dead-letters/replay-me/replay",
+            headers={"x-webhook-token": "secret"},
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "status": "replayed",
+        "incident_id": "inc-replay-me",
+    }
+    app.state.orchestrator.prepare_replay.assert_called_once()
+    prepared_alert = app.state.orchestrator.prepare_replay.call_args.args[0]
+    assert prepared_alert.id == "replay-me"
+    with closing(sqlite3.connect(settings.db_path)) as conn:
+        active = conn.execute(
+            """
+            SELECT attempt_count, next_attempt_at, last_error
+            FROM alert_queue
+            WHERE alert_id = ?
+            """,
+            ("replay-me",),
+        ).fetchone()
+        dead_count = conn.execute(
+            "SELECT COUNT(*) FROM alert_dead_letters WHERE alert_id = ?",
+            ("replay-me",),
+        ).fetchone()
+    assert active == (0, 0, None)
+    assert dead_count == (0,)

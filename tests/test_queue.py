@@ -276,6 +276,64 @@ async def test_durable_queue_dead_letters_after_maximum_attempts(tmp_path):
     assert dead_letter[3]
 
 
+async def test_replay_dead_letter_resets_retry_state_and_wakes_worker(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    seen: list[str] = []
+    prepared: list[str] = []
+
+    async def handler(alert: Alert) -> None:
+        assert prepared == [alert.id]
+        seen.append(alert.id)
+
+    queue = AlertQueue(handler=handler, db_path=db_path)
+    with closing(sqlite3.connect(db_path)) as conn:
+        conn.execute(
+            """
+            INSERT INTO alert_dead_letters
+                (alert_id, payload, attempt_count, last_error, failed_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                "replay-me",
+                _alert("replay-me").model_dump_json(),
+                5,
+                "permanent failure",
+                "2026-08-07 12:00:00",
+            ),
+        )
+        conn.commit()
+
+    def prepare(alert: Alert) -> None:
+        with closing(sqlite3.connect(db_path)) as conn:
+            active = conn.execute(
+                """
+                SELECT attempt_count, next_attempt_at, last_error
+                FROM alert_queue
+                WHERE alert_id = ?
+                """,
+                (alert.id,),
+            ).fetchone()
+            dead = conn.execute(
+                "SELECT COUNT(*) FROM alert_dead_letters WHERE alert_id = ?",
+                (alert.id,),
+            ).fetchone()
+        assert active == (0, 0, None)
+        assert dead == (0,)
+        prepared.append(alert.id)
+
+    replayed = await queue.replay_dead_letter("replay-me", before_wake=prepare)
+    queue.start()
+    for _ in range(100):
+        if seen:
+            break
+        await asyncio.sleep(0.01)
+    await queue.stop()
+
+    assert replayed.id == "replay-me"
+    assert seen == ["replay-me"]
+    assert queue.qsize() == 0
+
+
 def test_dead_letters_survive_queue_restart_and_stay_out_of_depth(tmp_path):
     db_path = tmp_path / "incidents.db"
     with closing(sqlite3.connect(db_path)) as conn:
