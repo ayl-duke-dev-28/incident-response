@@ -111,6 +111,11 @@ class IncidentOrchestrator:
         """
         return next((runbook for runbook in self._runbooks if runbook.slug == slug), None)
 
+    def prepare_replay(self, alert: Alert) -> None:
+        """Allow a replayed alert to run instead of taking the dedup path."""
+        fingerprint = alert_fingerprint(alert, self._config.dedup_bucket_minutes)
+        self._dedup.forget(fingerprint)
+
     async def _stream_triage(
         self,
         alert: Alert,

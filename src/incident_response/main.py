@@ -5,6 +5,7 @@ Endpoints:
   POST /alerts/{id}/resolve        → mark resolved, generate post-mortem
   GET  /incidents/{id}             → fetch current state
   GET  /dead-letters               → list exhausted alerts
+  POST /dead-letters/{id}/replay   → requeue an exhausted alert
   GET  /healthz
   GET  /readyz                     → reports queue depth and readiness
 """
@@ -32,7 +33,12 @@ from .integrations.slack import build_slack_client
 from .logging_config import configure_logging, set_incident_id, set_trace_id
 from .models import Alert, Incident, IncidentStatus, Severity
 from .orchestrator import IncidentOrchestrator, OrchestratorConfig
-from .queue import AlertQueue, DeadLetter
+from .queue import (
+    AlertAlreadyQueuedError,
+    AlertQueue,
+    DeadLetter,
+    DeadLetterNotFoundError,
+)
 from .rate_limit import SlidingWindowRateLimiter
 from .security import verify_datadog, verify_generic_hmac, verify_pagerduty
 from .telemetry import current_trace_id, instrument_app, setup_tracing
@@ -215,6 +221,26 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
         _body: bytes = Depends(_verify_inbound),
     ) -> list[DeadLetter]:
         return queue.list_dead_letters(limit=limit)
+
+    @app.post("/dead-letters/{alert_id}/replay", status_code=202)
+    async def replay_dead_letter(
+        alert_id: str,
+        request: Request,
+        _body: bytes = Depends(_verify_inbound),
+    ) -> dict[str, str]:
+        try:
+            alert = await queue.replay_dead_letter(
+                alert_id,
+                before_wake=orchestrator.prepare_replay,
+            )
+        except DeadLetterNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Dead letter not found") from exc
+        except AlertAlreadyQueuedError as exc:
+            raise HTTPException(status_code=409, detail="Alert is already queued") from exc
+        incident_id = f"inc-{alert.id}"
+        set_incident_id(incident_id)
+        logger.info("dead_letter_replayed", extra={"alert_id": alert.id})
+        return {"status": "replayed", "incident_id": incident_id}
 
     @app.post("/alerts", status_code=202)
     async def fire_alert(

@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 AlertHandler = Callable[[Alert], Awaitable[None]]
 
 
+class DeadLetterNotFoundError(LookupError):
+    pass
+
+
+class AlertAlreadyQueuedError(RuntimeError):
+    pass
+
+
 class DeadLetter(BaseModel):
     alert: Alert
     attempt_count: int
@@ -224,6 +232,35 @@ class _DurableAlertStore:
             for row in rows
         ]
 
+    def replay_dead_letter(self, alert_id: str) -> Alert:
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT payload FROM alert_dead_letters WHERE alert_id = ?",
+                (alert_id,),
+            ).fetchone()
+            if row is None:
+                raise DeadLetterNotFoundError(alert_id)
+            active = conn.execute(
+                "SELECT 1 FROM alert_queue WHERE alert_id = ?",
+                (alert_id,),
+            ).fetchone()
+            if active is not None:
+                raise AlertAlreadyQueuedError(alert_id)
+            conn.execute(
+                """
+                INSERT INTO alert_queue
+                    (alert_id, payload, attempt_count, next_attempt_at, last_error)
+                VALUES (?, ?, 0, 0, NULL)
+                """,
+                (alert_id, row["payload"]),
+            )
+            conn.execute(
+                "DELETE FROM alert_dead_letters WHERE alert_id = ?",
+                (alert_id,),
+            )
+        return Alert.model_validate_json(row["payload"])
+
 
 class AlertQueue:
     def __init__(
@@ -339,3 +376,17 @@ class AlertQueue:
         if self._store is None:
             return []
         return self._store.list_dead_letters(limit)
+
+    async def replay_dead_letter(
+        self,
+        alert_id: str,
+        *,
+        before_wake: Callable[[Alert], None] | None = None,
+    ) -> Alert:
+        if self._store is None:
+            raise DeadLetterNotFoundError(alert_id)
+        alert = self._store.replay_dead_letter(alert_id)
+        if before_wake is not None:
+            before_wake(alert)
+        await self._queue.put(alert.id)
+        return alert
