@@ -15,6 +15,7 @@ Anthropic, GitHub, Slack, and Datadog.
 - Recover unfinished alerts when the service restarts.
 - Retry failed alert handling automatically with persisted exponential backoff,
   then dead-letter alerts that exhaust the configured attempt limit.
+- Inspect dead-lettered alerts through an authenticated, read-only API.
 - Deduplicate repeated alerts in a 15-minute service/metric/severity bucket.
 - Triage recent commits, match the best runbook, and estimate user impact in parallel.
 - Stream a Slack incident brief as each agent finishes.
@@ -164,6 +165,13 @@ Filter or limit the list:
 curl "http://localhost:8080/incidents?status=investigating&limit=10"
 ```
 
+Inspect alerts that exhausted their retry limit:
+
+```bash
+curl http://localhost:8080/dead-letters \
+  -H "x-webhook-token: change-me"
+```
+
 Resolve it and generate a post-mortem:
 
 ```bash
@@ -291,6 +299,7 @@ Useful demo flags:
 | `POST` | `/alerts` | Persist an alert, wake the worker, and return `202 {status, incident_id}`. |
 | `GET` | `/incidents` | List recent incidents, newest first. Supports `status` and `limit` query params. |
 | `GET` | `/incidents/{id}` | Fetch current incident state. |
+| `GET` | `/dead-letters` | List exhausted alerts, newest first. Requires webhook authentication and supports a `limit` query param. |
 | `POST` | `/alerts/{id}/remediation/approve` | Approve and execute the persisted proposal. Requires webhook authentication and `decided_by`; accepts an optional note. |
 | `POST` | `/alerts/{id}/remediation/reject` | Permanently reject the persisted proposal without execution. Requires webhook authentication and `decided_by`; accepts an optional note. |
 | `POST` | `/alerts/{id}/resolve` | Mark resolved and generate a post-mortem. |
@@ -360,6 +369,16 @@ Authentication:
 
 Any one valid credential is enough.
 
+Dead-letter list query params:
+
+| Param | Default | Notes |
+|---|---:|---|
+| `limit` | `50` | Maximum dead letters to return. Must be between `1` and `200`; out-of-range values return `422`. |
+
+`GET /dead-letters` returns the original alert plus its final `attempt_count`,
+`last_error`, and `failed_at` timestamp. Results are ordered by failure time,
+newest first. Listing is read-only and does not delete or requeue rows.
+
 ## Durable Alert Queue
 
 <!-- AUTO-GENERATED: durable queue behavior from src/incident_response/queue.py and main.py -->
@@ -392,9 +411,17 @@ letters are excluded from this active depth and are not polled again. Direct
 `AlertQueue` users that omit `db_path` still get the original in-memory-only
 behavior; the FastAPI application always supplies `Settings.db_path`.
 
+Authenticated operators can inspect exhausted work with `GET /dead-letters`.
+The endpoint returns the original alert, final attempt count, last stored error,
+and failure timestamp, ordered by failure time with the newest first. Its
+optional `limit` defaults to 50 and accepts values from 1 through 200. Listing
+does not modify durable storage or active queue depth. See the
+[dead-letter listing TDD evidence](docs/testing/durable-alert-queue-slice-4.tdd.md)
+for the tested contract.
+
 This slice assumes one active queue worker per SQLite database. It does not yet
-provide processing leases, operator APIs for listing or replaying dead letters,
-or atomic cross-process job claims.
+provide processing leases, an operator API for replaying dead letters, or atomic
+cross-process job claims.
 
 <!-- END AUTO-GENERATED -->
 
@@ -594,7 +621,7 @@ pytest
 Current suite:
 
 ```text
-164 passed, no network required
+171 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -681,7 +708,7 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 ## Current Limits
 
 - The durable queue has restart recovery, timed retries, bounded attempts, and
-  durable dead-letter storage, but no processing leases, dead-letter listing or
+  authenticated dead-letter listing, but no processing leases, dead-letter
   replay API, or cross-process job claiming.
 - No Redis-backed rate limit or dedup for multi-instance deployments.
 - No incident merging across services.
