@@ -13,8 +13,11 @@ import logging
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Iterator
+
+from pydantic import BaseModel
 
 from .models import Alert
 
@@ -22,6 +25,13 @@ logger = logging.getLogger(__name__)
 
 
 AlertHandler = Callable[[Alert], Awaitable[None]]
+
+
+class DeadLetter(BaseModel):
+    alert: Alert
+    attempt_count: int
+    last_error: str
+    failed_at: datetime
 
 _QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS alert_queue (
@@ -193,6 +203,27 @@ class _DurableAlertStore:
             row = conn.execute("SELECT COUNT(*) AS count FROM alert_queue").fetchone()
         return int(row["count"])
 
+    def list_dead_letters(self, limit: int) -> list[DeadLetter]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT payload, attempt_count, last_error, failed_at
+                FROM alert_dead_letters
+                ORDER BY failed_at DESC, alert_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            DeadLetter(
+                alert=Alert.model_validate_json(row["payload"]),
+                attempt_count=int(row["attempt_count"]),
+                last_error=str(row["last_error"]),
+                failed_at=row["failed_at"],
+            )
+            for row in rows
+        ]
+
 
 class AlertQueue:
     def __init__(
@@ -303,3 +334,8 @@ class AlertQueue:
         if self._store is not None:
             return self._store.count()
         return self._queue.qsize()
+
+    def list_dead_letters(self, limit: int = 50) -> list[DeadLetter]:
+        if self._store is None:
+            return []
+        return self._store.list_dead_letters(limit)

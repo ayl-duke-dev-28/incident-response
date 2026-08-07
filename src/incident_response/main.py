@@ -4,6 +4,7 @@ Endpoints:
   POST /alerts                     → enqueue an incident (returns 202 + incident_id)
   POST /alerts/{id}/resolve        → mark resolved, generate post-mortem
   GET  /incidents/{id}             → fetch current state
+  GET  /dead-letters               → list exhausted alerts
   GET  /healthz
   GET  /readyz                     → reports queue depth and readiness
 """
@@ -31,7 +32,7 @@ from .integrations.slack import build_slack_client
 from .logging_config import configure_logging, set_incident_id, set_trace_id
 from .models import Alert, Incident, IncidentStatus, Severity
 from .orchestrator import IncidentOrchestrator, OrchestratorConfig
-from .queue import AlertQueue
+from .queue import AlertQueue, DeadLetter
 from .rate_limit import SlidingWindowRateLimiter
 from .security import verify_datadog, verify_generic_hmac, verify_pagerduty
 from .telemetry import current_trace_id, instrument_app, setup_tracing
@@ -206,6 +207,14 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
     @app.get("/readyz")
     async def readyz() -> dict[str, Any]:
         return {"status": "ok", "queue_depth": queue.qsize()}
+
+    @app.get("/dead-letters")
+    async def list_dead_letters(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+        _body: bytes = Depends(_verify_inbound),
+    ) -> list[DeadLetter]:
+        return queue.list_dead_letters(limit=limit)
 
     @app.post("/alerts", status_code=202)
     async def fire_alert(
