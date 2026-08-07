@@ -15,7 +15,7 @@ Anthropic, GitHub, Slack, and Datadog.
 - Recover unfinished alerts when the service restarts.
 - Retry failed alert handling automatically with persisted exponential backoff,
   then dead-letter alerts that exhaust the configured attempt limit.
-- Inspect dead-lettered alerts through an authenticated, read-only API.
+- Inspect and replay dead-lettered alerts through authenticated operator APIs.
 - Deduplicate repeated alerts in a 15-minute service/metric/severity bucket.
 - Triage recent commits, match the best runbook, and estimate user impact in parallel.
 - Stream a Slack incident brief as each agent finishes.
@@ -172,6 +172,13 @@ curl http://localhost:8080/dead-letters \
   -H "x-webhook-token: change-me"
 ```
 
+Replay one exhausted alert:
+
+```bash
+curl -X POST http://localhost:8080/dead-letters/ddg-9273/replay \
+  -H "x-webhook-token: change-me"
+```
+
 Resolve it and generate a post-mortem:
 
 ```bash
@@ -300,6 +307,7 @@ Useful demo flags:
 | `GET` | `/incidents` | List recent incidents, newest first. Supports `status` and `limit` query params. |
 | `GET` | `/incidents/{id}` | Fetch current incident state. |
 | `GET` | `/dead-letters` | List exhausted alerts, newest first. Requires webhook authentication and supports a `limit` query param. |
+| `POST` | `/dead-letters/{alert_id}/replay` | Atomically return one exhausted alert to the active queue. Requires webhook authentication. |
 | `POST` | `/alerts/{id}/remediation/approve` | Approve and execute the persisted proposal. Requires webhook authentication and `decided_by`; accepts an optional note. |
 | `POST` | `/alerts/{id}/remediation/reject` | Permanently reject the persisted proposal without execution. Requires webhook authentication and `decided_by`; accepts an optional note. |
 | `POST` | `/alerts/{id}/resolve` | Mark resolved and generate a post-mortem. |
@@ -379,6 +387,12 @@ Dead-letter list query params:
 `last_error`, and `failed_at` timestamp. Results are ordered by failure time,
 newest first. Listing is read-only and does not delete or requeue rows.
 
+`POST /dead-letters/{alert_id}/replay` moves one dead letter back to the active
+queue, resets its attempt count and retry schedule, clears its final error, and
+wakes the worker. It returns `202` with the incident ID. Missing dead letters
+return `404`; an alert ID already present in the active queue returns `409`
+without changing either row.
+
 ## Durable Alert Queue
 
 <!-- AUTO-GENERATED: durable queue behavior from src/incident_response/queue.py and main.py -->
@@ -419,9 +433,17 @@ does not modify durable storage or active queue depth. See the
 [dead-letter listing TDD evidence](docs/testing/durable-alert-queue-slice-4.tdd.md)
 for the tested contract.
 
+Authenticated operators can replay one row with
+`POST /dead-letters/{alert_id}/replay`. The database transition is atomic: it
+inserts a fresh active row with retry state reset and deletes the dead letter in
+the same transaction. The service then clears in-memory deduplication state and
+wakes the worker. A conflict with an existing active row leaves both rows
+unchanged. See the
+[dead-letter replay TDD evidence](docs/testing/durable-alert-queue-slice-5.tdd.md)
+for the tested contract.
+
 This slice assumes one active queue worker per SQLite database. It does not yet
-provide processing leases, an operator API for replaying dead letters, or atomic
-cross-process job claims.
+provide processing leases or atomic cross-process job claims.
 
 <!-- END AUTO-GENERATED -->
 
@@ -621,7 +643,7 @@ pytest
 Current suite:
 
 ```text
-171 passed, no network required
+177 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -708,8 +730,8 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 ## Current Limits
 
 - The durable queue has restart recovery, timed retries, bounded attempts, and
-  authenticated dead-letter listing, but no processing leases, dead-letter
-  replay API, or cross-process job claiming.
+  authenticated dead-letter listing and replay, but no processing leases or
+  cross-process job claiming.
 - No Redis-backed rate limit or dedup for multi-instance deployments.
 - No incident merging across services.
 - No on-call rotation lookup.
