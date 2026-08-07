@@ -179,6 +179,12 @@ curl -X POST http://localhost:8080/dead-letters/ddg-9273/replay \
   -H "x-webhook-token: change-me"
 ```
 
+Response:
+
+```json
+{"status":"replayed","incident_id":"inc-ddg-9273"}
+```
+
 Resolve it and generate a post-mortem:
 
 ```bash
