@@ -1,6 +1,6 @@
 from incident_response.agents.llm import FakeLLM
 from incident_response.db import IncidentStore
-from incident_response.dedup import DedupIndex
+from incident_response.dedup import DedupIndex, alert_fingerprint
 from incident_response.executor import MockExecutor
 from incident_response.integrations.github import MockGitHubClient
 from incident_response.integrations.metrics import MockMetricsClient
@@ -43,3 +43,29 @@ async def test_duplicate_alert_within_bucket_attaches_to_existing(alert, tmp_db,
     assert len(slack.sent) == posts_after_first
     # Timeline captured the duplicate.
     assert any("Duplicate" in e["event"] for e in second.timeline)
+
+
+def test_prepare_replay_clears_the_alert_fingerprint(
+    alert, tmp_db, postmortem_dir, runbooks_dir
+):
+    dedup = DedupIndex()
+    fingerprint = alert_fingerprint(alert)
+    dedup.set(fingerprint, f"inc-{alert.id}")
+    orch = IncidentOrchestrator(
+        llm=FakeLLM([]),
+        github=MockGitHubClient(),
+        slack=MockSlackClient(),
+        metrics=MockMetricsClient(),
+        store=IncidentStore(tmp_db),
+        config=OrchestratorConfig(
+            slack_channel="#x",
+            runbooks_dir=runbooks_dir,
+            postmortem_dir=postmortem_dir,
+        ),
+        dedup=dedup,
+        executor=MockExecutor(),
+    )
+
+    orch.prepare_replay(alert)
+
+    assert dedup.get(fingerprint) is None
