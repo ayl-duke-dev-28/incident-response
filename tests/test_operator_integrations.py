@@ -3,9 +3,16 @@ from datetime import datetime, timezone
 
 import httpx
 
+from incident_response.agents.llm import FakeLLM
+from incident_response.db import IncidentStore
+from incident_response.executor import MockExecutor
+from incident_response.integrations.github import MockGitHubClient
+from incident_response.integrations.metrics import MockMetricsClient
 from incident_response.integrations.on_call import PagerDutyOnCallClient
+from incident_response.integrations.slack import MockSlackClient
 from incident_response.integrations.tickets import JiraTicketClient, LinearTicketClient
-from incident_response.models import Alert, Incident, Severity
+from incident_response.models import Alert, Incident, OnCallResponder, Severity
+from incident_response.orchestrator import IncidentOrchestrator, OrchestratorConfig
 
 
 def _incident() -> Incident:
@@ -130,3 +137,49 @@ async def test_linear_creates_incident_ticket_and_returns_reference():
     assert captured["authorization"] == "lin_api_token"
     assert reference.provider == "linear"
     assert reference.external_id == "OPS-9"
+
+
+async def test_new_incident_persists_current_on_call(tmp_db, postmortem_dir, runbooks_dir):
+    class OnCall:
+        async def lookup(self, service: str):
+            return [
+                OnCallResponder(
+                    provider="pagerduty",
+                    user_id="PUSER",
+                    name="Alex Operator",
+                    email="alex@example.com",
+                    schedule="Primary",
+                )
+            ]
+
+    orchestrator = IncidentOrchestrator(
+        llm=FakeLLM(
+            [
+                {"suspects": []},
+                {"slug": "", "confidence": 0.0, "reasoning": ""},
+                {
+                    "affected_users": 1,
+                    "affected_percent": 0.1,
+                    "error_rate": 0.001,
+                    "reasoning": "low impact",
+                },
+            ]
+        ),
+        github=MockGitHubClient(),
+        slack=MockSlackClient(),
+        metrics=MockMetricsClient(),
+        store=IncidentStore(tmp_db),
+        config=OrchestratorConfig(
+            slack_channel="#incidents",
+            runbooks_dir=runbooks_dir,
+            postmortem_dir=postmortem_dir,
+        ),
+        dedup=None,
+        executor=MockExecutor(),
+        on_call=OnCall(),
+    )
+
+    incident = await orchestrator.handle_alert(_incident().alert)
+
+    assert incident.on_call[0].email == "alex@example.com"
+    assert orchestrator.store.get(incident.id).on_call == incident.on_call
