@@ -125,6 +125,14 @@ class Settings(BaseSettings):
             raise ValueError("Production requires OIDC client credentials")
         if not self.oidc_metadata_url.startswith("https://"):
             raise ValueError("Production OIDC metadata URL must use HTTPS")
+        if self.webhook_token == "change-me" or (
+            self.webhook_token and len(self.webhook_token) < 32
+        ):
+            raise ValueError("Production webhook token must be empty or at least 32 characters")
+        if len(self.datadog_webhook_secret) < 32 or len(self.pagerduty_webhook_secret) < 32:
+            raise ValueError("Production requires provider webhook signing secrets")
+        if not self.webhook_token and len(self.generic_webhook_secret) < 32:
+            raise ValueError("Production generic alerts require a webhook token or signing secret")
         integration_modes = (self.pagerduty_mode, self.jira_mode, self.linear_mode)
         if "mock" in integration_modes:
             raise ValueError("Production integrations must be explicitly disabled or real")

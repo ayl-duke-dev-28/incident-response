@@ -22,7 +22,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command")
 
     serve = subcommands.add_parser("serve", help="run the FastAPI server")
-    serve.add_argument("--host", default="0.0.0.0", help="host to bind")
+    serve.add_argument("--host", default="127.0.0.1", help="host to bind")
     serve.add_argument("--port", type=int, default=8080, help="port to bind")
     serve.add_argument("--reload", action="store_true", help="enable uvicorn reload")
 

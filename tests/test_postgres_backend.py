@@ -273,6 +273,9 @@ def test_production_app_uses_postgres_stores_and_manages_database_lifecycle(
         pagerduty_mode="disabled",
         jira_mode="disabled",
         linear_mode="disabled",
+        webhook_token="w" * 32,
+        datadog_webhook_secret="d" * 32,
+        pagerduty_webhook_secret="p" * 32,
         llm_mode="mock",
         runbooks_dir=runbooks_dir,
     )

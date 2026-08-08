@@ -405,21 +405,33 @@ def create_app(
         pd_sig = request.headers.get("x-pagerduty-signature", "")
         generic_sig = request.headers.get("x-webhook-signature", "")
 
-        hmac_ok = (
-            (settings.datadog_webhook_secret and verify_datadog(settings.datadog_webhook_secret, body, dd_sig))
-            or (settings.pagerduty_webhook_secret and verify_pagerduty(settings.pagerduty_webhook_secret, body, pd_sig))
-            or (settings.generic_webhook_secret and verify_generic_hmac(settings.generic_webhook_secret, body, generic_sig))
+        generic_ok = settings.generic_webhook_secret and verify_generic_hmac(
+            settings.generic_webhook_secret,
+            body,
+            generic_sig,
+        )
+        legacy_provider_ok = settings.environment != "production" and (
+            (
+                settings.datadog_webhook_secret
+                and verify_datadog(settings.datadog_webhook_secret, body, dd_sig)
+            )
+            or (
+                settings.pagerduty_webhook_secret
+                and verify_pagerduty(settings.pagerduty_webhook_secret, body, pd_sig)
+            )
         )
 
         # Any one valid credential is enough. Token is the default; HMAC is stronger if set.
-        if not (token_ok or hmac_ok):
+        if not (token_ok or generic_ok or legacy_provider_ok):
             raise HTTPException(status_code=401, detail="Invalid webhook credentials")
         return body
 
     async def _verify_provider(request: Request, provider: str) -> bytes:
         body = await request.body()
         token = request.headers.get("x-webhook-token", "")
-        token_ok = bool(settings.webhook_token) and hmac.compare_digest(
+        token_ok = settings.environment != "production" and bool(
+            settings.webhook_token
+        ) and hmac.compare_digest(
             token,
             settings.webhook_token,
         )
@@ -521,13 +533,19 @@ def create_app(
 
         @app.get("/auth/callback", name="auth_callback")
         async def auth_callback(request: Request):
-            token = await oidc_client.authorize_access_token(request)
             try:
+                token = await oidc_client.authorize_access_token(request)
                 session = auth_policy.session_from_oidc_token(token)
             except PermissionError as exc:
                 raise HTTPException(
                     status_code=403,
                     detail="OIDC user is not authorized",
+                ) from exc
+            except Exception as exc:
+                logger.warning("oidc_callback_failed")
+                raise HTTPException(
+                    status_code=502,
+                    detail="OIDC authentication failed",
                 ) from exc
             request.session.clear()
             request.session.update(session)
