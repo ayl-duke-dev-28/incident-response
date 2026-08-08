@@ -1,5 +1,6 @@
 """Domain models. All values are immutable — use `model_copy(update=...)` to derive new ones."""
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -169,6 +170,7 @@ class RemediationRequest(BaseModel):
 class Incident(BaseModel):
     id: str
     alert: Alert
+    related_alerts: list[Alert] = Field(default_factory=list)
     status: IncidentStatus = IncidentStatus.OPEN
     created_at: datetime
     resolved_at: datetime | None = None
@@ -178,6 +180,13 @@ class Incident(BaseModel):
     timeline: list[dict[str, Any]] = Field(default_factory=list)
     verification_outcome: VerificationOutcome | None = None
     remediation: RemediationRequest | None = None
+
+
+@dataclass(frozen=True)
+class CorrelationResult:
+    incident: Incident
+    created: bool
+    duplicate: bool
 
 
 class MetricPoint(BaseModel):

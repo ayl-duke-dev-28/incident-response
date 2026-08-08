@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from .models import Incident, IncidentStatus, RemediationStatus
+from .models import Alert, CorrelationResult, Incident, IncidentStatus, RemediationStatus
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS incidents (
@@ -20,6 +20,22 @@ CREATE TABLE IF NOT EXISTS incidents (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS incidents_status_idx ON incidents(status);
+
+CREATE TABLE IF NOT EXISTS incident_alerts (
+    source TEXT NOT NULL,
+    provider_event_id TEXT NOT NULL,
+    incident_id TEXT NOT NULL,
+    correlation_key TEXT NOT NULL,
+    triggered_at TEXT NOT NULL,
+    PRIMARY KEY (source, provider_event_id)
+);
+CREATE INDEX IF NOT EXISTS incident_alerts_incident_idx ON incident_alerts(incident_id);
+
+CREATE TABLE IF NOT EXISTS incident_correlations (
+    correlation_key TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL,
+    last_alert_at TEXT NOT NULL
+);
 """
 
 
@@ -79,6 +95,95 @@ class IncidentStore:
     def get(self, incident_id: str) -> Incident | None:
         with self._conn() as conn:
             return self._get_with_conn(conn, incident_id)
+
+    def correlate_alert(
+        self,
+        alert: Alert,
+        candidate: Incident,
+        *,
+        merge_window_minutes: int,
+    ) -> CorrelationResult:
+        """Atomically create, attach, or return an idempotent provider retry."""
+        source = alert.source or "generic"
+        event_id = alert.provider_event_id or alert.id
+        key = alert.correlation_key or (
+            f"{alert.service}|{alert.metric or ''}|{alert.environment or ''}"
+        )
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            membership = conn.execute(
+                """
+                SELECT incident_id FROM incident_alerts
+                WHERE source = ? AND provider_event_id = ?
+                """,
+                (source, event_id),
+            ).fetchone()
+            if membership is not None:
+                incident = self._get_with_conn(conn, membership["incident_id"])
+                if incident is None:
+                    raise RuntimeError("Alert membership references a missing incident")
+                return CorrelationResult(incident=incident, created=False, duplicate=True)
+
+            correlation = conn.execute(
+                "SELECT incident_id FROM incident_correlations WHERE correlation_key = ?",
+                (key,),
+            ).fetchone()
+            incident = (
+                self._get_with_conn(conn, correlation["incident_id"])
+                if correlation is not None
+                else None
+            )
+            within_window = bool(
+                incident
+                and abs(alert.triggered_at - incident.created_at)
+                <= timedelta(minutes=merge_window_minutes)
+            )
+            if (
+                incident is not None
+                and incident.status != IncidentStatus.RESOLVED
+                and within_window
+            ):
+                attached_at = datetime.now(alert.triggered_at.tzinfo)
+                incident = incident.model_copy(
+                    update={
+                        "related_alerts": incident.related_alerts + [alert],
+                        "timeline": incident.timeline
+                        + [
+                            {
+                                "timestamp": attached_at.isoformat(),
+                                "event": (
+                                    f"Correlated {source} alert attached: {alert.title} "
+                                    f"(event_id={event_id}, service={alert.service})"
+                                ),
+                            }
+                        ],
+                    }
+                )
+                created = False
+            else:
+                incident = candidate
+                created = True
+
+            self._save_with_conn(conn, incident)
+            conn.execute(
+                """
+                INSERT INTO incident_correlations (correlation_key, incident_id, last_alert_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(correlation_key) DO UPDATE SET
+                    incident_id = excluded.incident_id,
+                    last_alert_at = excluded.last_alert_at
+                """,
+                (key, incident.id, alert.triggered_at.isoformat()),
+            )
+            conn.execute(
+                """
+                INSERT INTO incident_alerts
+                    (source, provider_event_id, incident_id, correlation_key, triggered_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (source, event_id, incident.id, key, alert.triggered_at.isoformat()),
+            )
+            return CorrelationResult(incident=incident, created=created, duplicate=False)
 
     def decide_remediation(
         self,
