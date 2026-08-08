@@ -212,6 +212,20 @@ class ExternalReference(BaseModel):
     url: str
 
 
+class OutboxMessage(BaseModel):
+    model_config = {"frozen": True}
+
+    id: str
+    aggregate_id: str
+    destination: str
+    idempotency_key: str
+    status: str = "pending"
+    attempt_count: int = 0
+    next_attempt_at: float = 0
+    lease_token: str | None = None
+    lease_expires_at: float | None = None
+
+
 class MetricPoint(BaseModel):
     model_config = {"frozen": True}
 
