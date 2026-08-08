@@ -35,12 +35,17 @@ class Alert(BaseModel):
     model_config = {"frozen": True}
 
     id: str
+    source: str = "generic"
+    provider_event_id: str = ""
+    provider_incident_key: str | None = None
+    correlation_key: str = ""
     title: str
     description: str = ""
     service: str
     severity: Severity = Severity.SEV3
     triggered_at: datetime
     metric: str | None = None
+    environment: str = ""
     threshold: float | None = None
     value: float | None = None
     tags: dict[str, str] = Field(default_factory=dict)
