@@ -76,3 +76,65 @@ def test_rate_limit_returns_429(tmp_path):
         assert client.post("/alerts", json=_ALERT, headers=headers).status_code == 202
         assert client.post("/alerts", json=_ALERT, headers=headers).status_code == 202
         assert client.post("/alerts", json=_ALERT, headers=headers).status_code == 429
+
+
+def test_provider_endpoints_verify_their_own_signature_and_normalize(tmp_path):
+    datadog = {
+        "id": "event-7",
+        "title": "Checkout errors",
+        "date": 1_722_528_000,
+        "service": "checkout",
+        "metric": "http.errors",
+    }
+    body = json.dumps(datadog).encode()
+    signature = base64.b64encode(
+        hmac.new(b"dd-secret", body, hashlib.sha256).digest()
+    ).decode()
+    settings = _settings(
+        tmp_path,
+        datadog_webhook_secret="dd-secret",
+        pagerduty_webhook_secret="pd-secret",
+    )
+
+    with TestClient(create_app(settings=settings, llm=_llm())) as client:
+        accepted = client.post(
+            "/alerts/datadog",
+            content=body,
+            headers={
+                "content-type": "application/json",
+                "x-datadog-signature": signature,
+            },
+        )
+        wrong_provider = client.post(
+            "/alerts/pagerduty",
+            content=body,
+            headers={
+                "content-type": "application/json",
+                "x-datadog-signature": signature,
+            },
+        )
+
+    assert accepted.status_code == 202
+    assert accepted.json()["incident_id"] == "inc-datadog:event-7"
+    assert wrong_provider.status_code == 401
+
+
+def test_invalid_provider_payload_returns_422_without_enqueueing(tmp_path):
+    body = b'{"unexpected": true}'
+    signature = base64.b64encode(
+        hmac.new(b"dd-secret", body, hashlib.sha256).digest()
+    ).decode()
+    settings = _settings(tmp_path, datadog_webhook_secret="dd-secret")
+
+    with TestClient(create_app(settings=settings, llm=_llm())) as client:
+        response = client.post(
+            "/alerts/datadog",
+            content=body,
+            headers={
+                "content-type": "application/json",
+                "x-datadog-signature": signature,
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "Invalid datadog alert payload"}
