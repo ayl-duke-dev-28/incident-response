@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import time
 from contextlib import closing
 
 import pytest
@@ -266,6 +267,37 @@ async def test_two_workers_claim_one_alert_only_once(tmp_path):
     assert first.qsize() == 0
 
 
+async def test_active_worker_renews_lease_during_long_handler(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    attempts: list[str] = []
+
+    async def handler(alert: Alert) -> None:
+        attempts.append(alert.id)
+        entered.set()
+        await release.wait()
+
+    first = AlertQueue(handler=handler, db_path=db_path, lease_seconds=0.15)
+    second = AlertQueue(handler=handler, db_path=db_path, lease_seconds=0.15)
+    await first.submit(_alert("long-running"))
+    first.start()
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    second.start()
+
+    await asyncio.sleep(0.4)
+    release.set()
+    for _ in range(100):
+        if first.qsize() == 0:
+            break
+        await asyncio.sleep(0.01)
+    await first.stop()
+    await second.stop()
+
+    assert attempts == ["long-running"]
+    assert first.qsize() == 0
+
+
 async def test_expired_lease_recovers_work_abandoned_by_crashed_worker(tmp_path):
     db_path = tmp_path / "incidents.db"
     abandoned = asyncio.Event()
@@ -309,43 +341,34 @@ async def test_expired_lease_recovers_work_abandoned_by_crashed_worker(tmp_path)
 
 
 @pytest.mark.parametrize("stale_worker_fails", [False, True])
-async def test_stale_worker_cannot_mutate_alert_reassigned_after_lease_expiry(
+def test_stale_worker_cannot_mutate_alert_reassigned_after_lease_expiry(
     tmp_path, stale_worker_fails
 ):
     db_path = tmp_path / "incidents.db"
-    first_entered = asyncio.Event()
-    first_release = asyncio.Event()
-    second_entered = asyncio.Event()
-    second_release = asyncio.Event()
-
-    async def first_handler(alert: Alert) -> None:
-        first_entered.set()
-        await first_release.wait()
-        if stale_worker_fails:
-            raise RuntimeError("stale failure")
-
-    async def second_handler(alert: Alert) -> None:
-        second_entered.set()
-        await second_release.wait()
-
-    first = AlertQueue(
-        handler=first_handler,
-        db_path=db_path,
-        lease_seconds=0.05,
-    )
-    second = AlertQueue(
-        handler=second_handler,
-        db_path=db_path,
+    queue = AlertQueue(handler=lambda alert: None, db_path=db_path)
+    store = queue._store
+    assert store is not None
+    assert store.enqueue(_alert("reassigned"))
+    first_claim = store.claim("reassigned", now=time.time(), lease_seconds=0.05)
+    assert first_claim is not None
+    second_claim = store.claim(
+        "reassigned",
+        now=time.time() + 1,
         lease_seconds=1,
     )
-    await first.submit(_alert("reassigned"))
-    first.start()
-    await asyncio.wait_for(first_entered.wait(), timeout=1)
-    second.start()
-    await asyncio.wait_for(second_entered.wait(), timeout=1)
+    assert second_claim is not None
 
-    first_release.set()
-    await asyncio.wait_for(first.stop(), timeout=1)
+    if stale_worker_fails:
+        store.record_failure(
+            "reassigned",
+            lease_token=first_claim.lease_token,
+            error="stale failure",
+            base_seconds=0,
+            max_seconds=0,
+            max_attempts=5,
+        )
+    else:
+        store.delete("reassigned", lease_token=first_claim.lease_token)
 
     with closing(sqlite3.connect(db_path)) as conn:
         row = conn.execute(
@@ -358,16 +381,10 @@ async def test_stale_worker_cannot_mutate_alert_reassigned_after_lease_expiry(
         ).fetchone()
     assert row is not None
     assert row[0:2] == (0, None)
-    assert row[2]
+    assert row[2] == second_claim.lease_token
     assert row[3] > 0
 
-    second_release.set()
-    for _ in range(100):
-        if second.qsize() == 0:
-            break
-        await asyncio.sleep(0.01)
-    await second.stop()
-    assert second.qsize() == 0
+    assert store.delete("reassigned", lease_token=second_claim.lease_token)
 
 
 async def test_durable_queue_dead_letters_after_maximum_attempts(tmp_path):
