@@ -8,12 +8,17 @@ def test_build_demo_alert_returns_the_deterministic_cli_scenario():
 
     assert alert.model_dump(mode="json") == {
         "id": "demo-checkout-001",
+        "source": "generic",
+        "provider_event_id": "",
+        "provider_incident_key": None,
+        "correlation_key": "",
         "title": "Checkout 5xx > 5%",
         "description": "checkout service error rate at 18%",
         "service": "checkout",
         "severity": "sev2",
         "triggered_at": "2026-07-02T21:05:00Z",
         "metric": "http.error_rate",
+        "environment": "",
         "threshold": 0.05,
         "value": 0.184,
         "tags": {"env": "demo"},
