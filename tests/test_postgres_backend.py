@@ -2,6 +2,10 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from fastapi.testclient import TestClient
+
+from incident_response.config import Settings
+from incident_response.main import create_app
 from incident_response.models import (
     Alert,
     Incident,
@@ -48,6 +52,21 @@ class RecordingDatabase:
     @contextmanager
     def connection(self):
         yield self.connection_value
+
+
+class LifecycleDatabase(RecordingDatabase):
+    def __init__(self, connection: RecordingConnection) -> None:
+        super().__init__(connection)
+        self.events: list[str] = []
+
+    def open(self, *, timeout: float = 30) -> None:
+        self.events.append("open")
+
+    def migrate(self) -> None:
+        self.events.append("migrate")
+
+    def close(self) -> None:
+        self.events.append("close")
 
 
 class RecordingPool:
@@ -166,3 +185,39 @@ def test_postgres_remediation_decision_locks_latest_incident_row():
     assert decided.remediation is not None
     assert decided.remediation.status == RemediationStatus.APPROVED
     assert any("FOR UPDATE" in statement for statement, _ in connection.calls)
+
+
+def test_production_app_uses_postgres_stores_and_manages_database_lifecycle(
+    runbooks_dir,
+):
+    database = LifecycleDatabase(RecordingConnection())
+
+    class Redis:
+        async def eval(self, *args):
+            return [1, 0]
+
+        async def get(self, key):
+            return None
+
+        async def set(self, key, value, *, ex):
+            return True
+
+        async def delete(self, key):
+            return 0
+
+    settings = Settings(
+        _env_file=None,
+        environment="production",
+        database_url="postgresql+psycopg://app:secret@db/incidents",
+        redis_url="rediss://redis:6379/0",
+        llm_mode="mock",
+        runbooks_dir=runbooks_dir,
+    )
+
+    app = create_app(settings, redis_client=Redis(), postgres_database=database)
+
+    assert isinstance(app.state.orchestrator.store, PostgresIncidentStore)
+    assert isinstance(app.state.queue._store, PostgresAlertStore)
+    with TestClient(app) as client:
+        assert client.get("/healthz").status_code == 200
+    assert database.events == ["open", "migrate", "close"]
