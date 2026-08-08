@@ -85,3 +85,30 @@ async def test_dispatcher_delivers_stable_key_and_bounds_retries(tmp_path):
     ]
     assert message.attempt_count == 2
     assert message.status == "dead"
+
+
+async def test_successful_dispatch_notifies_live_incident_subscribers(tmp_path):
+    store = IncidentStore(tmp_path / "incidents.db", outbox_destinations=("jira",))
+    incident = _incident()
+    store.save_with_ticket_outbox(incident)
+    notified: list[str] = []
+
+    class Tickets:
+        async def create(self, incident, *, idempotency_key):
+            return ExternalReference(
+                provider="jira",
+                external_id="OPS-42",
+                url="https://company.atlassian.net/browse/OPS-42",
+            )
+
+    async def notify(incident_id: str):
+        notified.append(incident_id)
+
+    dispatcher = OutboxDispatcher(
+        store=store,
+        ticket_clients={"jira": Tickets()},
+        notifier=notify,
+    )
+
+    assert await dispatcher.dispatch_once(now=100) is True
+    assert notified == [incident.id]
