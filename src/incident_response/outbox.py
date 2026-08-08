@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Protocol
 
 from .models import ExternalReference, Incident, OutboxMessage
@@ -61,6 +61,7 @@ class OutboxDispatcher:
         retry_max_seconds: float = 60,
         lease_seconds: float = 60,
         poll_seconds: float = 0.5,
+        notifier: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._store = store
         self._ticket_clients = dict(ticket_clients)
@@ -69,6 +70,7 @@ class OutboxDispatcher:
         self._retry_max_seconds = retry_max_seconds
         self._lease_seconds = lease_seconds
         self._poll_seconds = poll_seconds
+        self._notifier = notifier
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -90,6 +92,8 @@ class OutboxDispatcher:
             )
             if not self._store.complete_outbox(message, reference):
                 logger.warning("outbox_completion_lease_lost", extra={"outbox_id": message.id})
+            elif self._notifier is not None:
+                await self._notifier(message.aggregate_id)
         except Exception as exc:
             self._store.record_outbox_failure(
                 message,

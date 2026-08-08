@@ -317,6 +317,7 @@ def create_app(
         retry_max_seconds=settings.outbox_retry_max_seconds,
         lease_seconds=settings.outbox_lease_seconds,
         poll_seconds=settings.outbox_poll_seconds,
+        notifier=event_broker.publish,
     )
     @asynccontextmanager
     async def lifespan(app: FastAPI):
