@@ -106,6 +106,8 @@ def test_postgres_migrations_are_versioned_and_create_all_foundation_tables():
     assert "incidents" in sql
     assert "alert_queue" in sql
     assert "alert_dead_letters" in sql
+    assert "incident_alerts" in sql
+    assert "incident_correlations" in sql
     assert any("INSERT INTO schema_migrations" in statement for statement, _ in connection.calls)
 
 
