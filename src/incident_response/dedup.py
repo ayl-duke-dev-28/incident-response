@@ -8,10 +8,11 @@ opening a new one.
 from __future__ import annotations
 
 import hashlib
+import math
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Callable
+from typing import Callable, Protocol
 
 from .models import Alert
 
@@ -19,6 +20,17 @@ from .models import Alert
 DEFAULT_BUCKET_MINUTES = 15
 DEFAULT_TTL_SECONDS = 60 * 60  # 1 hour
 DEFAULT_MAX_KEYS = 4096
+
+
+class RedisKeyValueClient(Protocol):
+    async def get(self, key: str) -> object:
+        ...
+
+    async def set(self, key: str, value: str, *, ex: int) -> object:
+        ...
+
+    async def delete(self, key: str) -> object:
+        ...
 
 
 def alert_fingerprint(alert: Alert, bucket_minutes: int = DEFAULT_BUCKET_MINUTES) -> str:
@@ -57,3 +69,41 @@ class DedupIndex:
 
     def forget(self, fingerprint: str) -> None:
         self._entries.pop(fingerprint, None)
+
+
+class RedisDedupIndex:
+    """Cross-process fingerprint index backed by expiring Redis keys."""
+
+    def __init__(
+        self,
+        redis: RedisKeyValueClient,
+        *,
+        ttl_seconds: float = DEFAULT_TTL_SECONDS,
+        namespace: str = "incident-response",
+    ) -> None:
+        if ttl_seconds <= 0:
+            raise ValueError("ttl_seconds must be positive")
+        self._redis = redis
+        self._ttl_seconds = max(1, math.ceil(ttl_seconds))
+        self._prefix = f"{namespace}:dedup:"
+
+    def _key(self, fingerprint: str) -> str:
+        return f"{self._prefix}{fingerprint}"
+
+    async def get(self, fingerprint: str) -> str | None:
+        value = await self._redis.get(self._key(fingerprint))
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return str(value)
+
+    async def set(self, fingerprint: str, incident_id: str) -> None:
+        await self._redis.set(
+            self._key(fingerprint),
+            incident_id,
+            ex=self._ttl_seconds,
+        )
+
+    async def forget(self, fingerprint: str) -> None:
+        await self._redis.delete(self._key(fingerprint))

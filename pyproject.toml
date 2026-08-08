@@ -27,6 +27,9 @@ otel = [
     "opentelemetry-instrumentation-fastapi>=0.49b0",
     "opentelemetry-instrumentation-httpx>=0.49b0",
 ]
+production = [
+    "redis>=6.4.0,<9",
+]
 
 [project.scripts]
 incident-response = "incident_response.cli:main"

@@ -8,6 +8,7 @@ users may omit ``db_path`` to retain a purely in-memory queue.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import sqlite3
@@ -521,12 +522,14 @@ class AlertQueue:
         self,
         alert_id: str,
         *,
-        before_wake: Callable[[Alert], None] | None = None,
+        before_wake: Callable[[Alert], object] | None = None,
     ) -> Alert:
         if self._store is None:
             raise DeadLetterNotFoundError(alert_id)
         alert = self._store.replay_dead_letter(alert_id)
         if before_wake is not None:
-            before_wake(alert)
+            prepared = before_wake(alert)
+            if inspect.isawaitable(prepared):
+                await prepared
         await self._queue.put(alert.id)
         return alert

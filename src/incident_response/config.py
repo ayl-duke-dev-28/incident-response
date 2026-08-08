@@ -1,7 +1,9 @@
 """Runtime configuration loaded from environment variables."""
 
 from pathlib import Path
+from typing import Literal
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -28,6 +30,11 @@ class Settings(BaseSettings):
     runbooks_dir: Path = Path("./runbooks")
     postmortem_dir: Path = Path("./postmortems")
     db_path: Path = Path("./incidents.db")
+    environment: Literal["development", "production"] = "development"
+    database_url: str = ""
+    redis_url: str = ""
+    redis_namespace: str = "incident-response"
+    redis_require_tls: bool = True
     webhook_token: str = "change-me"
 
     # Durable alert queue retry schedule
@@ -62,6 +69,18 @@ class Settings(BaseSettings):
     # Observability
     log_level: str = "INFO"
     otel_service_name: str = "incident-response"
+
+    @model_validator(mode="after")
+    def validate_production_services(self) -> "Settings":
+        if self.environment != "production":
+            return self
+        if not self.database_url.startswith("postgresql+"):
+            raise ValueError("Production requires a PostgreSQL DATABASE_URL")
+        if not self.redis_url:
+            raise ValueError("Production requires a Redis REDIS_URL")
+        if self.redis_require_tls and not self.redis_url.startswith("rediss://"):
+            raise ValueError("Production Redis requires TLS via rediss://")
+        return self
 
 
 def load_settings() -> Settings:

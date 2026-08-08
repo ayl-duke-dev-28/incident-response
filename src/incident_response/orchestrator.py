@@ -8,6 +8,7 @@ and post a thread reply.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -20,7 +21,7 @@ from .agents.postmortem import generate_postmortem
 from .agents.runbook import match_runbook
 from .agents.triage import identify_suspects
 from .db import IncidentStore
-from .dedup import DedupIndex, alert_fingerprint
+from .dedup import DedupIndex, RedisDedupIndex, alert_fingerprint
 from .executor import (
     MockExecutor,
     RemediationExecutor,
@@ -83,7 +84,7 @@ class IncidentOrchestrator:
         metrics: MetricsClient,
         store: IncidentStore,
         config: OrchestratorConfig,
-        dedup: DedupIndex | None = None,
+        dedup: DedupIndex | RedisDedupIndex | None = None,
         executor: RemediationExecutor | None = None,
     ) -> None:
         self._llm = llm
@@ -111,10 +112,10 @@ class IncidentOrchestrator:
         """
         return next((runbook for runbook in self._runbooks if runbook.slug == slug), None)
 
-    def prepare_replay(self, alert: Alert) -> None:
+    def prepare_replay(self, alert: Alert) -> object:
         """Allow a replayed alert to run instead of taking the dedup path."""
         fingerprint = alert_fingerprint(alert, self._config.dedup_bucket_minutes)
-        self._dedup.forget(fingerprint)
+        return self._dedup.forget(fingerprint)
 
     async def _stream_triage(
         self,
@@ -241,6 +242,8 @@ class IncidentOrchestrator:
         fingerprint = alert_fingerprint(alert, self._config.dedup_bucket_minutes)
 
         existing_id = self._dedup.get(fingerprint)
+        if inspect.isawaitable(existing_id):
+            existing_id = await existing_id
         if existing_id:
             existing = self._store.get(existing_id)
             if existing and existing.status != IncidentStatus.RESOLVED:
@@ -274,7 +277,9 @@ class IncidentOrchestrator:
             timeline=[{"timestamp": now.isoformat(), "event": f"Alert fired: {alert.title}"}],
         )
         self._store.save(incident)
-        self._dedup.set(fingerprint, incident.id)
+        stored = self._dedup.set(fingerprint, incident.id)
+        if inspect.isawaitable(stored):
+            await stored
         logger.info("incident_opened", extra={"service": alert.service, "severity": alert.severity.value})
 
         triage, slack_ts, _baseline_series = await self._stream_triage(

@@ -13,6 +13,7 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+from inspect import isawaitable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
@@ -25,7 +26,7 @@ from .agents.llm import AnthropicLLM, DemoLLM, LLM
 from .config import Settings, load_settings
 from .console import STATIC_DIR, register_console
 from .db import IncidentStore
-from .dedup import DedupIndex
+from .dedup import DedupIndex, RedisDedupIndex
 from .executor import MockExecutor, RemediationExecutor, ShellExecutor
 from .integrations.github import build_github_client
 from .integrations.metrics import build_metrics_client
@@ -39,7 +40,7 @@ from .queue import (
     DeadLetter,
     DeadLetterNotFoundError,
 )
-from .rate_limit import SlidingWindowRateLimiter
+from .rate_limit import RedisSlidingWindowRateLimiter, SlidingWindowRateLimiter
 from .security import verify_datadog, verify_generic_hmac, verify_pagerduty
 from .telemetry import current_trace_id, instrument_app, setup_tracing
 
@@ -57,7 +58,12 @@ def build_executor(settings: Settings) -> RemediationExecutor:
     return MockExecutor()
 
 
-def build_orchestrator(settings: Settings, llm: LLM | None = None) -> IncidentOrchestrator:
+def build_orchestrator(
+    settings: Settings,
+    llm: LLM | None = None,
+    *,
+    dedup: DedupIndex | RedisDedupIndex | None = None,
+) -> IncidentOrchestrator:
     if llm is None:
         if settings.llm_mode == "mock":
             llm = DemoLLM()
@@ -81,7 +87,7 @@ def build_orchestrator(settings: Settings, llm: LLM | None = None) -> IncidentOr
         settings.metrics_mode, settings.datadog_api_key, settings.datadog_app_key
     )
     store = IncidentStore(settings.db_path)
-    dedup = DedupIndex(ttl_seconds=settings.dedup_ttl_seconds)
+    dedup = dedup or DedupIndex(ttl_seconds=settings.dedup_ttl_seconds)
     executor = build_executor(settings)
 
     config = OrchestratorConfig(
@@ -131,12 +137,47 @@ class RemediationDecisionPayload(BaseModel):
     note: str = Field(default="", max_length=500)
 
 
-def create_app(settings: Settings | None = None, llm: LLM | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    llm: LLM | None = None,
+    *,
+    redis_client: Any | None = None,
+) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings.log_level)
     setup_tracing(settings.otel_service_name)
 
-    orchestrator = build_orchestrator(settings, llm=llm)
+    owns_redis = False
+    if settings.redis_url:
+        if redis_client is None:
+            try:
+                import redis.asyncio as redis
+            except ImportError as exc:
+                raise RuntimeError(
+                    "REDIS_URL requires the production dependencies; "
+                    "install incident-response[production]"
+                ) from exc
+            redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+            owns_redis = True
+        dedup = RedisDedupIndex(
+            redis_client,
+            ttl_seconds=settings.dedup_ttl_seconds,
+            namespace=settings.redis_namespace,
+        )
+        limiter = RedisSlidingWindowRateLimiter(
+            redis_client,
+            max_events=settings.rate_limit_max,
+            window_seconds=settings.rate_limit_window_seconds,
+            namespace=settings.redis_namespace,
+        )
+    else:
+        dedup = DedupIndex(ttl_seconds=settings.dedup_ttl_seconds)
+        limiter = SlidingWindowRateLimiter(
+            max_events=settings.rate_limit_max,
+            window_seconds=settings.rate_limit_window_seconds,
+        )
+
+    orchestrator = build_orchestrator(settings, llm=llm, dedup=dedup)
     queue = AlertQueue(
         handler=orchestrator.handle_alert,
         db_path=settings.db_path,
@@ -145,11 +186,6 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
         max_attempts=settings.queue_max_attempts,
         lease_seconds=settings.queue_lease_seconds,
     )
-    limiter = SlidingWindowRateLimiter(
-        max_events=settings.rate_limit_max,
-        window_seconds=settings.rate_limit_window_seconds,
-    )
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         queue.start()
@@ -158,6 +194,8 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
             yield
         finally:
             await queue.stop()
+            if owns_redis:
+                await redis_client.aclose()
             logger.info("app_stopped")
 
     app = FastAPI(title="Autonomous Incident Response", version="0.2.0", lifespan=lifespan)
@@ -166,6 +204,7 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
     app.state.orchestrator = orchestrator
     app.state.queue = queue
     app.state.limiter = limiter
+    app.state.redis = redis_client
     app.state.settings = settings
 
     @app.middleware("http")
@@ -198,10 +237,13 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
             raise HTTPException(status_code=401, detail="Invalid webhook credentials")
         return body
 
-    def _rate_limit(request: Request, service: str) -> None:
+    async def _rate_limit(request: Request, service: str) -> None:
         client_ip = request.client.host if request.client else "unknown"
         key = f"{client_ip}|{service}"
-        if not limiter.check(key):
+        allowed = limiter.check(key)
+        if isawaitable(allowed):
+            allowed = await allowed
+        if not allowed:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=f"rate limited for {key}",
@@ -249,7 +291,7 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
         request: Request,
         _body: bytes = Depends(_verify_inbound),
     ) -> dict[str, str]:
-        _rate_limit(request, payload.service)
+        await _rate_limit(request, payload.service)
         alert = payload.to_alert()
         incident_id = f"inc-{alert.id}"
         set_incident_id(incident_id)
