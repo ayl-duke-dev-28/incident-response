@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,6 +89,7 @@ class IncidentOrchestrator:
         dedup: DedupIndex | RedisDedupIndex | None = None,
         executor: RemediationExecutor | None = None,
         on_call: OnCallClient | None = None,
+        notifier: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._llm = llm
         self._github = github
@@ -98,6 +100,7 @@ class IncidentOrchestrator:
         self._dedup = dedup or DedupIndex()
         self._executor = executor or MockExecutor()
         self._on_call = on_call or DisabledOnCallClient()
+        self._notifier = notifier
         self._runbooks: list[Runbook] = load_runbooks(config.runbooks_dir)
         self._history = PostmortemHistory.load(config.postmortem_dir)
 
@@ -119,6 +122,10 @@ class IncidentOrchestrator:
         """Allow a replayed alert to run instead of taking the dedup path."""
         fingerprint = alert_fingerprint(alert, self._config.dedup_bucket_minutes)
         return self._dedup.forget(fingerprint)
+
+    async def _notify(self, incident_id: str) -> None:
+        if self._notifier is not None:
+            await self._notifier(incident_id)
 
     async def _stream_triage(
         self,
@@ -261,6 +268,7 @@ class IncidentOrchestrator:
             merge_window_minutes=self._config.dedup_bucket_minutes,
         )
         incident = correlation.incident
+        await self._notify(incident.id)
         if not correlation.created:
             set_incident_id(incident.id)
             logger.info(
@@ -293,6 +301,7 @@ class IncidentOrchestrator:
             }
         )
         self._store.save(incident)
+        await self._notify(incident.id)
 
         await self._maybe_annotate_pr(incident, triage)
 
@@ -330,6 +339,7 @@ class IncidentOrchestrator:
                     }
                 )
                 self._store.save(incident)
+                await self._notify(incident.id)
                 await self._slack.post(
                     channel=self._config.slack_channel,
                     text=(
@@ -341,6 +351,7 @@ class IncidentOrchestrator:
                     thread_ts=slack_ts,
                 )
         self._store.save_with_ticket_outbox(incident)
+        await self._notify(incident.id)
         return incident
 
     async def approve_remediation(
@@ -360,6 +371,7 @@ class IncidentOrchestrator:
             decided_by=decided_by,
             note=note,
         )
+        await self._notify(incident.id)
         approved = incident.remediation
         assert approved is not None
 
@@ -388,6 +400,7 @@ class IncidentOrchestrator:
                 summary="Remediation executor failed",
                 finished_at=datetime.now(timezone.utc),
             )
+            await self._notify(incident_id)
             raise
 
         completion_summary = summary or "Remediation completed with no executable steps."
@@ -397,6 +410,7 @@ class IncidentOrchestrator:
             summary=completion_summary,
             finished_at=datetime.now(timezone.utc),
         )
+        await self._notify(incident.id)
 
         if (
             executed_any
@@ -431,6 +445,7 @@ class IncidentOrchestrator:
             decided_by=decided_by,
             note=note,
         )
+        await self._notify(incident.id)
         event = f"Remediation rejected by {decided_by}."
         if note:
             event += f" {note}"
@@ -529,6 +544,8 @@ class IncidentOrchestrator:
             runbook_slug=runbook_slug,
         )
         self._store.save(incident.model_copy(update={"verification_outcome": outcome}))
+        if self._notifier is not None:
+            asyncio.create_task(self._notifier(incident_id))
 
     async def _run_remediation(
         self, persisted_steps: list[RemediationStep], thread_ts: str | None
@@ -597,6 +614,7 @@ class IncidentOrchestrator:
         pm_path = self._write_postmortem(incident, markdown)
         incident = incident.model_copy(update={"postmortem_path": str(pm_path)})
         self._store.save(incident)
+        await self._notify(incident.id)
 
         if incident.slack_message_ts:
             await self._slack.post(

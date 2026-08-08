@@ -18,6 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from .config import Settings
 from .auth import AuthContext
 from .demo import build_unique_console_demo_alert
+from .events import incident_version
 from .models import Incident, IncidentStatus, RemediationStatus, Runbook
 from .orchestrator import IncidentOrchestrator
 from .queue import AlertQueue
@@ -44,7 +45,6 @@ _EMPTY_BODY = (
 )
 
 _DEMO_PERSIST_TIMEOUT_SECONDS = 1.0
-_TRIAGE_REFRESH_SECONDS = 3
 _MAX_RESOLUTION_NOTE_CHARS = 500
 _MAX_RESOLUTION_BODY_BYTES = 8192
 
@@ -132,6 +132,10 @@ def _mock_console_writes_enabled(settings: Settings) -> bool:
     )
 
 
+def _operator_console_writes_enabled(settings: Settings) -> bool:
+    return settings.auth_mode == "oidc" or _mock_console_writes_enabled(settings)
+
+
 def _csrf_input(csrf_token: str) -> str:
     if not csrf_token:
         return ""
@@ -180,19 +184,14 @@ def _render_environment(settings: Settings) -> str:
     return f'<div class="modes">{tags}</div>'
 
 
-def _page(title: str, body: str, *, refresh_seconds: int | None = None) -> str:
-    refresh = (
-        f'<meta http-equiv="refresh" content="{refresh_seconds}">'
-        if refresh_seconds is not None
-        else ""
-    )
+def _page(title: str, body: str) -> str:
     return (
         "<!doctype html>"
         '<html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width, initial-scale=1">'
-        f"{refresh}"
         f"<title>{escape(title)}</title>"
         '<link rel="stylesheet" href="/static/console.css">'
+        '<script src="/static/console.js" defer></script>'
         f"</head><body>{body}</body></html>"
     )
 
@@ -405,7 +404,7 @@ def _render_remediation_approval(
     )
     decision = ""
     if remediation.status == RemediationStatus.PENDING:
-        if _mock_console_writes_enabled(settings):
+        if _operator_console_writes_enabled(settings):
             base = f"/console/incidents/{escape(incident.id)}/remediation"
             decision = (
                 '<div class="approval-actions">'
@@ -466,7 +465,7 @@ def _render_resolve_action(
     csrf_token: str = "",
 ) -> str:
     if (
-        not _mock_console_writes_enabled(settings)
+        not _operator_console_writes_enabled(settings)
         or incident.status == IncidentStatus.RESOLVED
         or incident.triage is None
     ):
@@ -495,12 +494,15 @@ def _render_incident_detail(
         refresh_status = (
             '<p class="refresh-status" role="status">'
             "<strong>Triage in progress.</strong> "
-            f"Refreshing automatically every {_TRIAGE_REFRESH_SECONDS} seconds."
+            "Live updates connected."
             "</p>"
         )
     body = (
         _detail_header(incident)
-        + '<main class="detail-main">'
+        + (
+            f'<main class="detail-main" data-incident-id="{escape(incident.id)}" '
+            f'data-incident-version="{incident_version(incident)}">'
+        )
         + refresh_status
         + _render_alert_detail(incident)
         + _render_triage_detail(incident)
@@ -510,11 +512,7 @@ def _render_incident_detail(
         + _render_resolution(incident)
         + "</main>"
     )
-    return _page(
-        f"{incident.id} · Incident console",
-        body,
-        refresh_seconds=_TRIAGE_REFRESH_SECONDS if triage_in_progress else None,
-    )
+    return _page(f"{incident.id} · Incident console", body)
 
 
 def _render_not_found(incident_id: str) -> str:
@@ -807,7 +805,7 @@ def register_console(
     async def console_resolve_incident(
         incident_id: str, request: Request
     ) -> Response:
-        if not _mock_console_writes_enabled(settings):
+        if not _operator_console_writes_enabled(settings):
             return HTMLResponse(
                 content=_render_console_error(
                     "Console writes unavailable",
@@ -870,7 +868,7 @@ def register_console(
         *,
         approve: bool,
     ) -> Response:
-        if not _mock_console_writes_enabled(settings):
+        if not _operator_console_writes_enabled(settings):
             return HTMLResponse(
                 content=_render_console_error(
                     "Console writes unavailable",
@@ -890,17 +888,23 @@ def register_console(
         note, error = await _remediation_note(request)
         if error is not None:
             return error
+        principal = auth.principal(request) if auth is not None else None
+        decided_by = (
+            principal.email or principal.subject
+            if auth is not None and auth.enabled and principal is not None
+            else "local-console"
+        )
         try:
             if approve:
                 await orchestrator.approve_remediation(
                     incident_id,
-                    decided_by="local-console",
+                    decided_by=decided_by,
                     note=note or "",
                 )
             else:
                 await orchestrator.reject_remediation(
                     incident_id,
-                    decided_by="local-console",
+                    decided_by=decided_by,
                     note=note or "",
                 )
         except LookupError:

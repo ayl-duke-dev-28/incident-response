@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import hmac
+import json
 import secrets
 from inspect import isawaitable
 from contextlib import asynccontextmanager
@@ -25,7 +26,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.middleware.sessions import SessionMiddleware
-from starlette.responses import RedirectResponse
+from starlette.responses import RedirectResponse, StreamingResponse
 
 from .agents.llm import AnthropicLLM, DemoLLM, LLM
 from .auth import (
@@ -42,6 +43,7 @@ from .console import STATIC_DIR, register_console
 from .db import IncidentStore
 from .dedup import DedupIndex, RedisDedupIndex
 from .executor import MockExecutor, RemediationExecutor, ShellExecutor
+from .events import IncidentEventBroker, incident_version
 from .integrations.github import build_github_client
 from .integrations.metrics import build_metrics_client
 from .integrations.on_call import OnCallClient, build_on_call_client
@@ -84,6 +86,7 @@ def build_orchestrator(
     dedup: DedupIndex | RedisDedupIndex | None = None,
     store: IncidentStore | PostgresIncidentStore | None = None,
     on_call: OnCallClient | None = None,
+    notifier: Any | None = None,
 ) -> IncidentOrchestrator:
     if llm is None:
         if settings.llm_mode == "mock":
@@ -130,6 +133,7 @@ def build_orchestrator(
         dedup=dedup,
         executor=executor,
         on_call=on_call,
+        notifier=notifier,
     )
 
 
@@ -284,12 +288,17 @@ def create_app(
         service_ids=settings.pagerduty_service_ids,
         http=provider_http_client,
     )
+    event_broker = IncidentEventBroker(
+        redis_client,
+        namespace=settings.redis_namespace,
+    )
     orchestrator = build_orchestrator(
         settings,
         llm=llm,
         dedup=dedup,
         store=incident_store,
         on_call=on_call,
+        notifier=event_broker.publish,
     )
     queue = AlertQueue(
         handler=orchestrator.handle_alert,
@@ -347,6 +356,7 @@ def create_app(
     app.state.orchestrator = orchestrator
     app.state.queue = queue
     app.state.outbox = outbox
+    app.state.event_broker = event_broker
     app.state.limiter = limiter
     app.state.redis = redis_client
     app.state.postgres_database = postgres_database
@@ -708,6 +718,54 @@ def create_app(
         if incident is None:
             raise HTTPException(status_code=404, detail="not found")
         return incident
+
+    @app.get("/events/incidents/{incident_id}")
+    async def incident_events(
+        incident_id: str,
+        request: Request,
+        _principal: Principal = Depends(_viewer),
+    ) -> StreamingResponse:
+        if orchestrator.store.get(incident_id) is None:
+            raise HTTPException(status_code=404, detail="not found")
+
+        async def stream():
+            last_version = request.headers.get("last-event-id", "")
+            incident = orchestrator.store.get(incident_id)
+            if incident is not None:
+                version = incident_version(incident)
+                last_version = version
+                yield (
+                    f"id: {version}\n"
+                    "event: incident\n"
+                    f"data: {json.dumps({'incident_id': incident_id, 'version': version})}\n\n"
+                )
+            async for changed in event_broker.events(incident_id):
+                if await request.is_disconnected():
+                    break
+                if not changed:
+                    yield ": heartbeat\n\n"
+                    continue
+                incident = orchestrator.store.get(incident_id)
+                if incident is None:
+                    continue
+                version = incident_version(incident)
+                if version == last_version:
+                    continue
+                last_version = version
+                yield (
+                    f"id: {version}\n"
+                    "event: incident\n"
+                    f"data: {json.dumps({'incident_id': incident_id, 'version': version})}\n\n"
+                )
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     register_console(
