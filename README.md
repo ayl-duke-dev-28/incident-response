@@ -2,23 +2,27 @@
 
 Autonomous Incident Response turns a production alert into an investigation brief,
 candidate root cause, matched runbook, safe remediation summary, and post-mortem.
-It is built as a local-first FastAPI service with deterministic mock adapters, so
-you can run the full flow without external credentials before wiring it to
-Anthropic, GitHub, Slack, and Datadog.
+It is built as a local-first FastAPI service with deterministic mock adapters and
+a production profile backed by PostgreSQL, Redis, OIDC, PagerDuty, Jira, and
+Linear.
 
 ## What You Can Do
 
-- Receive Datadog, PagerDuty, or generic webhook alerts at `POST /alerts`.
+- Receive normalized Datadog, PagerDuty, or generic webhook alerts through
+  provider-specific, signature-checked endpoints.
 - Authenticate webhooks with a shared token or HMAC signatures.
-- Persist accepted alerts to SQLite before returning `202`, then process them in
-  a background worker.
+- Persist accepted alerts before returning `202`, using SQLite locally or
+  PostgreSQL in production, then process them in a background worker.
 - Recover unfinished alerts when the service restarts.
-- Coordinate workers sharing one SQLite queue with renewable ownership leases
-  and expiry-based crash recovery.
+- Coordinate PostgreSQL workers with renewable leases and `SKIP LOCKED` claims.
 - Retry failed alert handling automatically with persisted exponential backoff,
   then dead-letter alerts that exhaust the configured attempt limit.
 - Inspect and replay dead-lettered alerts through authenticated operator APIs.
-- Deduplicate repeated alerts in a 15-minute service/metric/severity bucket.
+- Atomically deduplicate provider retries and merge related cross-service alerts
+  by provider incident key, explicit correlation key, or service/metric/environment.
+- Resolve and persist the current PagerDuty on-call responder and schedule.
+- Create Jira and Linear incident tickets through a leased transactional outbox
+  with stable idempotency keys, bounded retries, and dead-letter state.
 - Triage recent commits, match the best runbook, and estimate user impact in parallel.
 - Stream a Slack incident brief as each agent finishes.
 - Annotate the suspect PR when confidence clears the configured floor.
@@ -27,10 +31,10 @@ Anthropic, GitHub, Slack, and Datadog.
 - Verify whether remediation actually reduced the error rate.
 - Persist incident state to SQLite after every major step.
 - List recent incidents without knowing an incident ID.
-- Inspect open and recently resolved incidents, including full triage and timeline
-  detail, in a local web console.
-- Leave an incident detail page open while triage runs; it refreshes every three
-  seconds until the completed evidence is available.
+- Inspect open and recently resolved incidents in an OIDC-authenticated console
+  with viewer, responder, and admin roles.
+- Leave any incident detail page open for authenticated SSE updates delivered
+  through Redis across instances; the browser replaces content only on change.
 - Open matched runbooks directly from incident list and detail views.
 - Trigger a safe, collision-free demo incident from the console when every
   integration and remediation mode is mocked.
@@ -221,9 +225,10 @@ resolved ones. With no incidents stored, the page shows an empty state instead.
 Select **Trigger demo incident** to enqueue a unique checkout scenario. The
 console waits for the worker to persist it, then redirects to its detail page.
 While triage continues in the background, the detail page shows a visible status
-message and refreshes every three seconds. Refreshing stops as soon as triage data
-is available. You can also populate the console by sending the test alert from the
-API section above.
+message and opens an authenticated EventSource connection. Redis carries change
+notifications across instances, and the browser replaces the rendered content
+only when the persisted incident version changes. You can also populate the
+console by sending the test alert from the API section above.
 
 Select an incident title to open `/console/incidents/{id}`. The detail page shows:
 
@@ -239,48 +244,59 @@ Markdown source. URL slugs are matched only against runbooks loaded at startup;
 they are never resolved as filesystem paths.
 
 Incidents still being triaged render an in-progress state instead of incomplete
-sections and opt into the three-second refresh. Completed and resolved incidents
-do not refresh automatically. Once triage finishes in all-mock mode, the detail
-page shows a **Resolve incident** form. Submit an optional note of up to 500
-characters to mark the incident resolved, generate its post-mortem, and return to
-the updated detail page. Unknown incident IDs return a navigable HTML `404` page.
+sections. Open, completed, and resolved incident pages all retain the SSE stream.
+Once triage finishes, authorized responders see a **Resolve incident** form.
+Submit an optional note of up to 500 characters to mark the incident resolved,
+generate its post-mortem, and return to the updated detail page. Unknown incident
+IDs return a navigable HTML `404` page.
 
-When a runbook proposes remediation, the all-mock console shows **Approve and
-run** and **Reject** controls with an optional 500-character decision note. The
-decision is persisted before execution, is final, and remains visible after a
-reload. In real integration modes, use the authenticated approval API.
+When a runbook proposes remediation, authorized admins see **Approve and run**;
+responders can **Reject**. Both accept an optional 500-character decision note.
+The signed session, role, and CSRF token are checked before the final decision is
+persisted. OIDC identity, rather than form input, is recorded as the actor.
 
 The demo button is shown only when LLM, GitHub, Slack, metrics, and remediation
 modes are all `mock`. It is hidden and `POST /console/demo-alert` returns `403` if
 any mode could reach a real integration or execute shell remediation. Cross-site
 browser submissions are also rejected.
 
-The resolve form has the same all-mock and same-origin restrictions. It is hidden
-until triage finishes and after the incident is resolved. In real integration
-modes, resolve incidents through the authenticated `POST /alerts/{id}/resolve`
-API instead.
+In development with authentication disabled, console writes remain limited to
+the all-mock, same-origin workflow. In production, OIDC and RBAC enable the same
+resolution and remediation controls with CSRF protection.
 
 What works today:
 
 | Surface | Status |
 |---|---|
 | `GET /console` incident list | Working. |
-| `GET /console/incidents/{id}` incident detail | Working. Shows alert, triage, impact, runbook, suspect, timeline, verification, and resolution data. Refreshes every three seconds only while triage is pending. |
+| `GET /console/incidents/{id}` incident detail | Working. Shows alert, triage, impact, runbook, suspect, ownership, ticket references, timeline, verification, and resolution data with SSE updates. |
 | `GET /console/runbooks/{slug}` runbook preview | Working. Shows escaped Markdown for an already-loaded runbook and returns an HTML `404` for unknown slugs. |
-| `GET /static/console.css` | Working. |
+| `GET /static/console.css` and `console.js` | Working under the production CSP. |
 | `POST /console/demo-alert` demo action | Working in all-mock mode. Enqueues a unique demo incident and redirects to its detail page. Hidden and forbidden when any integration or remediation mode is not `mock`. |
-| Console remediation approval | Working in all-mock mode. Shows the persisted command proposal and allows one final approve or reject decision. |
-| `POST /console/incidents/{id}/resolve` resolve action | Working in all-mock mode after triage completes. Accepts a form-encoded resolution note, generates a post-mortem, and redirects to the resolved detail page. |
+| Console remediation approval | Working in all-mock development and with OIDC admin/responder roles in production. |
+| `POST /console/incidents/{id}/resolve` resolve action | Working after triage for all-mock development or OIDC responders. |
 
-The refresh behavior has integration coverage for pending, completed, and
-resolved incidents. Browser QA also exercised the empty, demo, in-progress,
-completed, runbook, resolved, HTML `404`, and mobile states with no findings
-(`100/100`). See the
+SSE rendering has integration coverage for pending, completed, and resolved
+incidents. Browser QA exercised the empty state, demo creation, SSE connection,
+remediation decision, and ticket/on-call persistence with no console errors. See the
 [console triage auto-refresh TDD evidence](docs/testing/console-triage-auto-refresh.tdd.md)
 for the exact test commands and results.
 
-The console is local-first and unauthenticated. See Current Limits before exposing
-it on anything other than localhost.
+Development defaults to local, unauthenticated operation. Production refuses to
+start without OIDC, secure signed sessions, PostgreSQL, TLS Redis, and strong
+webhook credentials.
+
+### Production identity and roles
+
+OIDC group claims map to `viewer`, `responder`, and `admin`. Viewers can read;
+responders can resolve and reject; admins can also approve remediation and replay
+dead letters. Browser writes require the signed session plus a constant-time CSRF
+token. Automation can use `Authorization: Bearer ...`; configure only SHA-256
+digests and roles in `OPERATOR_BEARER_TOKENS`, never plaintext API tokens.
+
+The browser session contains identity, role, expiry, and CSRF state only—not OIDC
+access or refresh tokens. Responses include CSP, frame denial, MIME sniffing and
+referrer controls; production also emits HSTS.
 
 ## CLI
 
@@ -295,7 +311,7 @@ Commands:
 | Command | Purpose |
 |---|---|
 | `incident-response demo` | Run the full incident lifecycle offline. |
-| `incident-response serve` | Start the FastAPI server. Defaults to `0.0.0.0:8080`; pass `--host 127.0.0.1` when using the unauthenticated console locally. |
+| `incident-response serve` | Start the FastAPI server. Defaults to `127.0.0.1:8080`; pass `--host` explicitly to bind another interface. |
 
 Useful demo flags:
 
@@ -309,26 +325,34 @@ Useful demo flags:
 
 ## API
 
+<!-- AUTO-GENERATED: routes from src/incident_response/main.py and console.py -->
+
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/alerts` | Persist an alert, wake the worker, and return `202 {status, incident_id}`. |
-| `GET` | `/incidents` | List recent incidents, newest first. Supports `status` and `limit` query params. |
-| `GET` | `/incidents/{id}` | Fetch current incident state. |
-| `GET` | `/dead-letters` | List exhausted alerts, newest first. Requires webhook authentication and supports a `limit` query param. |
-| `POST` | `/dead-letters/{alert_id}/replay` | Atomically return one exhausted alert to the active queue. Requires webhook authentication. |
-| `POST` | `/alerts/{id}/remediation/approve` | Approve and execute the persisted proposal. Requires webhook authentication and `decided_by`; accepts an optional note. |
-| `POST` | `/alerts/{id}/remediation/reject` | Permanently reject the persisted proposal without execution. Requires webhook authentication and `decided_by`; accepts an optional note. |
-| `POST` | `/alerts/{id}/resolve` | Mark resolved and generate a post-mortem. |
+| `POST` | `/alerts` | Validate generic webhook credentials, persist an alert, and return `202`. |
+| `POST` | `/alerts/datadog` | Validate the Datadog signature and normalize a Datadog alert. |
+| `POST` | `/alerts/pagerduty` | Validate the PagerDuty signature and normalize a v3 webhook event. |
+| `GET` | `/incidents` | List recent incidents. Requires `viewer`; supports `status` and `limit`. |
+| `GET` | `/incidents/{id}` | Fetch current incident state. Requires `viewer`. |
+| `GET` | `/dead-letters` | List exhausted alerts. Requires `viewer`. |
+| `POST` | `/dead-letters/{alert_id}/replay` | Return one exhausted alert to the queue. Requires `admin` and CSRF for sessions. |
+| `POST` | `/alerts/{id}/remediation/approve` | Approve and execute a persisted proposal. Requires `admin`. |
+| `POST` | `/alerts/{id}/remediation/reject` | Reject a persisted proposal. Requires `responder`. |
+| `POST` | `/alerts/{id}/resolve` | Resolve an incident and generate a post-mortem. Requires `responder`. |
+| `GET` | `/events/incidents/{id}` | Authenticated SSE stream with version events and heartbeats. Requires `viewer`. |
 | `GET` | `/healthz` | Liveness check. |
 | `GET` | `/readyz` | Liveness plus the number of persisted unfinished alerts in `queue_depth`. |
-| `GET` | `/console` | Operator incident list. Returns HTML, not JSON. Unauthenticated. |
-| `GET` | `/console/incidents/{id}` | Operator incident detail. Returns HTML, including an HTML `404` for unknown IDs. Unauthenticated. |
-| `GET` | `/console/runbooks/{slug}` | Preview an already-loaded runbook as escaped Markdown. Returns an HTML `404` for unknown slugs. Unauthenticated. |
+| `GET` | `/console` | Operator incident list. Requires `viewer` when OIDC is enabled. |
+| `GET` | `/console/incidents/{id}` | Live operator incident detail. Requires `viewer`. |
+| `GET` | `/console/runbooks/{slug}` | Escaped runbook preview. Requires `viewer`. |
 | `POST` | `/console/demo-alert` | Enqueue a unique checkout demo and redirect to its detail page. Available only when all integrations and remediation use `mock`. |
-| `POST` | `/console/incidents/{id}/remediation/approve` | Approve the persisted proposal and run the mock executor. All-mock and same-origin only. |
-| `POST` | `/console/incidents/{id}/remediation/reject` | Reject the persisted proposal without execution. All-mock and same-origin only. |
-| `POST` | `/console/incidents/{id}/resolve` | Resolve a triaged incident from the console and redirect to its detail page. Accepts form data with an optional `resolution_note` of at most 500 characters. Available only in all-mock mode. |
+| `POST` | `/console/incidents/{id}/remediation/approve` | Approve a proposal. Requires `admin` plus CSRF. |
+| `POST` | `/console/incidents/{id}/remediation/reject` | Reject a proposal. Requires `responder` plus CSRF. |
+| `POST` | `/console/incidents/{id}/resolve` | Resolve a triaged incident. Requires `responder` plus CSRF. |
 | `GET` | `/static/console.css` | Console stylesheet. |
+| `GET` | `/static/console.js` | CSP-compatible EventSource client for live incident updates. |
+
+<!-- END AUTO-GENERATED -->
 
 Incident list query params:
 
@@ -476,6 +500,8 @@ for long-running handler coverage.
 All runtime settings are loaded from environment variables or `.env`. The values
 below are the defaults unless the row says a credential is required.
 
+<!-- AUTO-GENERATED: settings from src/incident_response/config.py and .env.example -->
+
 | Env var | Modes / example | Notes |
 |---|---|---|
 | `LLM_MODE` | `anthropic` | Supports `anthropic` or `mock`; `mock` uses deterministic local responses. |
@@ -494,14 +520,42 @@ below are the defaults unless the row says a credential is required.
 | `RUNBOOKS_DIR` | `./runbooks` | Markdown runbook library. |
 | `POSTMORTEM_DIR` | `./postmortems` | Generated post-mortems. |
 | `DB_PATH` | `./incidents.db` | Shared SQLite file for incidents and durable alert queue rows. |
+| `ENVIRONMENT` | `development` | `production` enables fail-closed validation. |
+| `DATABASE_URL` | empty | Production PostgreSQL URL using `postgresql+psycopg://`. |
+| `REDIS_URL` | empty | Production Redis URL; `rediss://` is required when TLS enforcement is enabled. |
+| `REDIS_NAMESPACE` | `incident-response` | Prefix for rate-limit, dedup, and incident-event keys/channels. |
+| `REDIS_REQUIRE_TLS` | `true` | Reject plaintext production Redis URLs. |
 | `QUEUE_RETRY_BASE_SECONDS` | `1` | Delay before the first automatic queue retry. |
 | `QUEUE_RETRY_MAX_SECONDS` | `60` | Maximum exponential queue retry delay. Must be at least the base delay. |
 | `QUEUE_MAX_ATTEMPTS` | `5` | Handler failures allowed before an alert is moved to `alert_dead_letters`. Must be positive. |
 | `QUEUE_LEASE_SECONDS` | `300` | Queue ownership duration. Must be positive; active handlers renew every one-third of this interval. |
-| `WEBHOOK_TOKEN` | `change-me` | Shared webhook token. |
-| `DATADOG_WEBHOOK_SECRET` | empty | Optional Datadog HMAC secret. |
-| `PAGERDUTY_WEBHOOK_SECRET` | empty | Optional PagerDuty HMAC secret. |
+| `AUTH_MODE` | `disabled` | `oidc` is required in production. |
+| `SESSION_SECRET` | empty | Signed-session secret; at least 32 characters in production. |
+| `SESSION_SECONDS` | `28800` | Absolute application-session lifetime. |
+| `SESSION_HTTPS_ONLY` | `true` | Secure-cookie flag; required in production. |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | empty | OIDC authorization-code client credentials. |
+| `OIDC_METADATA_URL` | empty | HTTPS discovery document URL. |
+| `OIDC_GROUPS_CLAIM` | `groups` | Userinfo claim containing role groups. |
+| `OIDC_VIEWER_GROUPS` | `incident-viewers` | Comma-separated viewer groups. |
+| `OIDC_RESPONDER_GROUPS` | `incident-responders` | Comma-separated responder groups. |
+| `OIDC_ADMIN_GROUPS` | `incident-admins` | Comma-separated admin groups. |
+| `OPERATOR_BEARER_TOKENS` | empty | JSON mapping lowercase SHA-256 token digests to roles. |
+| `WEBHOOK_TOKEN` | `change-me` | Generic shared token; production rejects the default and short values. |
+| `DATADOG_WEBHOOK_SECRET` | empty | Datadog HMAC secret; required in production. |
+| `PAGERDUTY_WEBHOOK_SECRET` | empty | PagerDuty HMAC secret; required in production. |
 | `GENERIC_WEBHOOK_SECRET` | empty | Optional generic HMAC-SHA256 secret. |
+| `PAGERDUTY_MODE` | `mock` | `mock`, `disabled`, or `pagerduty`. Production forbids implicit mock mode. |
+| `PAGERDUTY_API_TOKEN` | empty | REST API token for service and on-call lookup. |
+| `PAGERDUTY_SERVICE_IDS` | empty | JSON mapping internal services to PagerDuty service IDs. |
+| `JIRA_MODE` | `mock` | `mock`, `disabled`, or `jira`. |
+| `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | empty | Jira Cloud connection and basic-auth credentials. |
+| `JIRA_PROJECT_KEY` / `JIRA_ISSUE_TYPE` | empty / `Incident` | Destination project and issue type. |
+| `LINEAR_MODE` | `mock` | `mock`, `disabled`, or `linear`. |
+| `LINEAR_API_TOKEN` / `LINEAR_TEAM_ID` | empty | Linear API key and destination team. |
+| `OUTBOX_RETRY_BASE_SECONDS` | `1` | Initial ticket delivery retry delay. |
+| `OUTBOX_RETRY_MAX_SECONDS` | `60` | Maximum ticket delivery retry delay. |
+| `OUTBOX_MAX_ATTEMPTS` | `5` | Attempts before ticket delivery is dead-lettered. |
+| `OUTBOX_LEASE_SECONDS` | `60` | Cross-process outbox claim duration. |
 | `RATE_LIMIT_MAX` | `30` | Maximum alerts per client-IP/service window. |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Sliding rate-limit window in seconds. |
 | `DEDUP_BUCKET_MINUTES` | `15` | Timestamp bucket used in alert fingerprints. |
@@ -515,6 +569,8 @@ below are the defaults unless the row says a credential is required.
 | `LOG_LEVEL` | `INFO` | Application log level. |
 | `OTEL_SERVICE_NAME` | `incident-response` | OpenTelemetry service name. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | Enables OTLP HTTP export when the optional `otel` dependencies are installed. |
+
+<!-- END AUTO-GENERATED -->
 
 To use real integrations, add values like these to `.env`:
 
@@ -532,6 +588,37 @@ SLACK_BOT_TOKEN=xoxb-...
 METRICS_MODE=datadog
 DATADOG_API_KEY=...
 DATADOG_APP_KEY=...
+```
+
+A production deployment must additionally select real or explicitly disabled
+operator integrations and provide shared infrastructure and identity:
+
+```dotenv
+ENVIRONMENT=production
+DATABASE_URL=postgresql+psycopg://incident:...@postgres/incident_response
+REDIS_URL=rediss://redis:6379/0
+
+AUTH_MODE=oidc
+SESSION_SECRET=<32-or-more-random-characters>
+OIDC_CLIENT_ID=incident-response
+OIDC_CLIENT_SECRET=...
+OIDC_METADATA_URL=https://identity.example/.well-known/openid-configuration
+
+WEBHOOK_TOKEN=<32-or-more-random-characters>
+DATADOG_WEBHOOK_SECRET=<32-or-more-random-characters>
+PAGERDUTY_WEBHOOK_SECRET=<32-or-more-random-characters>
+
+PAGERDUTY_MODE=pagerduty
+PAGERDUTY_API_TOKEN=...
+PAGERDUTY_SERVICE_IDS={"checkout":"PSERVICE123"}
+JIRA_MODE=jira
+JIRA_BASE_URL=https://company.atlassian.net
+JIRA_EMAIL=incidents@example.com
+JIRA_API_TOKEN=...
+JIRA_PROJECT_KEY=OPS
+LINEAR_MODE=linear
+LINEAR_API_TOKEN=lin_api_...
+LINEAR_TEAM_ID=...
 ```
 
 ## Incident Flow
@@ -756,22 +843,21 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 
 ## Current Limits
 
-- The durable queue has restart recovery, timed retries, bounded attempts, and
-  authenticated dead-letter listing and replay plus renewable cross-process
-  claims. Heartbeats reduce duplicate handling but cannot guarantee exactly-once
-  external side effects if renewal is delayed beyond the lease window.
-- No Redis-backed rate limit or dedup for multi-instance deployments.
-- No incident merging across services.
-- No on-call rotation lookup.
-- No Jira or Linear ticket creation.
-- No provider-specific alert normalization beyond the shared alert schema.
-- The console is local-first and has no authentication or RBAC. It
-  exposes full incident detail to anyone who can reach the port. Console writes
-  are restricted to demo creation, mock remediation decisions, and incident
-  resolution in all-mock mode;
-  real-integration resolution and remediation controls remain outside the console.
-  The CLI defaults to `0.0.0.0`, so pass `--host 127.0.0.1` unless you have placed
-  the service behind appropriate network and authentication controls.
-- The console uses a three-second full-page refresh while triage is pending. It
-  does not use WebSockets or push updates, and completed or resolved incidents do
-  not refresh.
+- PostgreSQL, Redis, and OIDC are mandatory only in the production profile. The
+  development profile intentionally keeps SQLite and local identity for a
+  zero-service demo.
+- Jira and Linear ticket creation is transactional on the application side, but
+  no system can promise exactly-once behavior after an ambiguous provider timeout
+  unless that provider honors or exposes a matching idempotency lookup. Stable
+  keys, persisted references, leases, and bounded retries minimize duplicates.
+- Slack brief streaming, GitHub annotation, and remediation commands still occur
+  inside the leased alert workflow rather than the ticket outbox. Lease renewal
+  and token-checked completion reduce stale work but cannot make arbitrary
+  external side effects mathematically exactly once.
+- PagerDuty service ownership uses an explicit internal-service-to-PagerDuty-ID
+  mapping. It does not discover that mapping from a service catalog.
+- Provider normalization currently covers Datadog, PagerDuty v3, and the generic
+  schema. Additional alert vendors need a normalizer and signature verifier.
+- Jira and Linear adapters create incident tickets and persist their references;
+  they do not yet synchronize later incident timeline or resolution changes back
+  to those tickets.
