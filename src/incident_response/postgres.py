@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Protocol
 from uuid import uuid4
 
-from .models import Alert, Incident, IncidentStatus, RemediationStatus
+from .models import (
+    Alert,
+    CorrelationResult,
+    Incident,
+    IncidentStatus,
+    RemediationStatus,
+)
 from .queue import (
     AlertAlreadyQueuedError,
     DeadLetter,
@@ -105,6 +111,25 @@ CREATE TABLE IF NOT EXISTS alert_dead_letters (
 );
 """
 
+_CORRELATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS incident_alerts (
+    source TEXT NOT NULL,
+    provider_event_id TEXT NOT NULL,
+    incident_id TEXT NOT NULL REFERENCES incidents(id),
+    correlation_key TEXT NOT NULL,
+    triggered_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (source, provider_event_id)
+);
+CREATE INDEX IF NOT EXISTS incident_alerts_incident_idx
+ON incident_alerts(incident_id);
+
+CREATE TABLE IF NOT EXISTS incident_correlations (
+    correlation_key TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL REFERENCES incidents(id),
+    last_alert_at TIMESTAMPTZ NOT NULL
+);
+"""
+
 
 def apply_postgres_migrations(connection: PostgresConnection) -> None:
     """Apply idempotent schema versions within the caller's transaction."""
@@ -126,6 +151,16 @@ def apply_postgres_migrations(connection: PostgresConnection) -> None:
         connection.execute(
             "INSERT INTO schema_migrations (version) VALUES (%s)",
             (1,),
+        )
+    row = connection.execute(
+        "SELECT version FROM schema_migrations WHERE version = %s",
+        (2,),
+    ).fetchone()
+    if row is None:
+        connection.execute(_CORRELATION_SCHEMA)
+        connection.execute(
+            "INSERT INTO schema_migrations (version) VALUES (%s)",
+            (2,),
         )
 
 
@@ -187,6 +222,105 @@ class PostgresIncidentStore:
     def get(self, incident_id: str) -> Incident | None:
         with self._database.connection() as connection:
             return self._get_with_conn(connection, incident_id)
+
+    def correlate_alert(
+        self,
+        alert: Alert,
+        candidate: Incident,
+        *,
+        merge_window_minutes: int,
+    ) -> CorrelationResult:
+        """Serialize a correlation key and attach a provider event exactly once."""
+        source = alert.source or "generic"
+        event_id = alert.provider_event_id or alert.id
+        key = alert.correlation_key or (
+            f"{alert.service}|{alert.metric or ''}|{alert.environment or ''}"
+        )
+        with self._database.connection() as connection:
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                (key,),
+            )
+            membership = connection.execute(
+                """
+                SELECT incident_id FROM incident_alerts
+                WHERE source = %s AND provider_event_id = %s
+                """,
+                (source, event_id),
+            ).fetchone()
+            if membership is not None:
+                incident = self._get_with_conn(connection, membership["incident_id"])
+                if incident is None:
+                    raise RuntimeError("Alert membership references a missing incident")
+                return CorrelationResult(incident=incident, created=False, duplicate=True)
+
+            correlation = connection.execute(
+                """
+                SELECT incident_id, last_alert_at FROM incident_correlations
+                WHERE correlation_key = %s
+                FOR UPDATE
+                """,
+                (key,),
+            ).fetchone()
+            incident = (
+                self._get_with_conn(connection, correlation["incident_id"], for_update=True)
+                if correlation is not None
+                else None
+            )
+            last_alert_at = correlation["last_alert_at"] if correlation is not None else None
+            within_window = bool(
+                incident
+                and isinstance(last_alert_at, datetime)
+                and abs(alert.triggered_at - last_alert_at)
+                <= timedelta(minutes=merge_window_minutes)
+            )
+            if (
+                incident is not None
+                and incident.status != IncidentStatus.RESOLVED
+                and within_window
+            ):
+                attached_at = datetime.now(alert.triggered_at.tzinfo)
+                incident = incident.model_copy(
+                    update={
+                        "related_alerts": incident.related_alerts + [alert],
+                        "timeline": incident.timeline
+                        + [
+                            {
+                                "timestamp": attached_at.isoformat(),
+                                "event": (
+                                    f"Duplicate/correlated {source} alert attached: {alert.title} "
+                                    f"(event_id={event_id}, service={alert.service})"
+                                ),
+                            }
+                        ],
+                    }
+                )
+                created = False
+            else:
+                incident = candidate
+                created = True
+
+            self._save_with_conn(connection, incident)
+            connection.execute(
+                """
+                INSERT INTO incident_correlations
+                    (correlation_key, incident_id, last_alert_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT(correlation_key) DO UPDATE SET
+                    incident_id = excluded.incident_id,
+                    last_alert_at = excluded.last_alert_at
+                """,
+                (key, incident.id, alert.triggered_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO incident_alerts
+                    (source, provider_event_id, incident_id, correlation_key, triggered_at)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (source, event_id, incident.id, key, alert.triggered_at),
+            )
+            return CorrelationResult(incident=incident, created=created, duplicate=False)
 
     def decide_remediation(
         self,

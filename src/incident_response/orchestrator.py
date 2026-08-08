@@ -241,32 +241,6 @@ class IncidentOrchestrator:
         now = datetime.now(timezone.utc)
         fingerprint = alert_fingerprint(alert, self._config.dedup_bucket_minutes)
 
-        existing_id = self._dedup.get(fingerprint)
-        if inspect.isawaitable(existing_id):
-            existing_id = await existing_id
-        if existing_id:
-            existing = self._store.get(existing_id)
-            if existing and existing.status != IncidentStatus.RESOLVED:
-                set_incident_id(existing_id)
-                logger.info(
-                    "alert_deduped",
-                    extra={"fingerprint": fingerprint, "incident_id": existing_id},
-                )
-                updated = existing.model_copy(
-                    update={
-                        "timeline": existing.timeline
-                        + [
-                            {
-                                "timestamp": now.isoformat(),
-                                "event": f"Duplicate alert attached: {alert.title} "
-                                f"(alert_id={alert.id})",
-                            }
-                        ]
-                    }
-                )
-                self._store.save(updated)
-                return updated
-
         incident_id = f"inc-{alert.id}"
         set_incident_id(incident_id)
         incident = Incident(
@@ -276,7 +250,19 @@ class IncidentOrchestrator:
             created_at=now,
             timeline=[{"timestamp": now.isoformat(), "event": f"Alert fired: {alert.title}"}],
         )
-        self._store.save(incident)
+        correlation = self._store.correlate_alert(
+            alert,
+            incident,
+            merge_window_minutes=self._config.dedup_bucket_minutes,
+        )
+        incident = correlation.incident
+        if not correlation.created:
+            set_incident_id(incident.id)
+            logger.info(
+                "alert_deduped" if correlation.duplicate else "alert_correlated",
+                extra={"fingerprint": fingerprint, "incident_id": incident.id},
+            )
+            return incident
         stored = self._dedup.set(fingerprint, incident.id)
         if inspect.isawaitable(stored):
             await stored

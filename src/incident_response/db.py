@@ -125,7 +125,10 @@ class IncidentStore:
                 return CorrelationResult(incident=incident, created=False, duplicate=True)
 
             correlation = conn.execute(
-                "SELECT incident_id FROM incident_correlations WHERE correlation_key = ?",
+                """
+                SELECT incident_id, last_alert_at FROM incident_correlations
+                WHERE correlation_key = ?
+                """,
                 (key,),
             ).fetchone()
             incident = (
@@ -133,9 +136,15 @@ class IncidentStore:
                 if correlation is not None
                 else None
             )
+            last_alert_at = (
+                datetime.fromisoformat(correlation["last_alert_at"])
+                if correlation is not None
+                else None
+            )
             within_window = bool(
                 incident
-                and abs(alert.triggered_at - incident.created_at)
+                and last_alert_at
+                and abs(alert.triggered_at - last_alert_at)
                 <= timedelta(minutes=merge_window_minutes)
             )
             if (
@@ -152,7 +161,7 @@ class IncidentStore:
                             {
                                 "timestamp": attached_at.isoformat(),
                                 "event": (
-                                    f"Correlated {source} alert attached: {alert.title} "
+                                    f"Duplicate/correlated {source} alert attached: {alert.title} "
                                     f"(event_id={event_id}, service={alert.service})"
                                 ),
                             }
