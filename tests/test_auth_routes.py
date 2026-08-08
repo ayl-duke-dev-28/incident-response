@@ -94,6 +94,11 @@ def test_console_redirects_to_oidc_and_callback_establishes_then_clears_session(
     assert callback.headers["location"] == "/console"
     assert authenticated.status_code == 200
     assert "provider-token-must-not-enter-session" not in authenticated.text
+    assert 'name="csrf_token" value="fixed-csrf-token"' in authenticated.text
+    assert authenticated.headers["x-content-type-options"] == "nosniff"
+    assert authenticated.headers["x-frame-options"] == "DENY"
+    assert authenticated.headers["referrer-policy"] == "same-origin"
+    assert "default-src 'self'" in authenticated.headers["content-security-policy"]
     assert logout.status_code == 303
     assert after_logout.status_code == 303
 
