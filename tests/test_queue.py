@@ -226,7 +226,148 @@ def test_durable_queue_migrates_slice_one_schema(tmp_path):
             row[1]
             for row in conn.execute("PRAGMA table_info(alert_queue)").fetchall()
         }
-    assert {"attempt_count", "next_attempt_at", "last_error"} <= columns
+    assert {
+        "attempt_count",
+        "next_attempt_at",
+        "last_error",
+        "lease_token",
+        "lease_expires_at",
+    } <= columns
+
+
+async def test_two_workers_claim_one_alert_only_once(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    attempts: list[str] = []
+
+    async def handler(alert: Alert) -> None:
+        attempts.append(alert.id)
+        entered.set()
+        await release.wait()
+
+    first = AlertQueue(handler=handler, db_path=db_path, lease_seconds=1)
+    second = AlertQueue(handler=handler, db_path=db_path, lease_seconds=1)
+    await first.submit(_alert("claimed-once"))
+    first.start()
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    second.start()
+
+    await asyncio.sleep(0.2)
+    assert attempts == ["claimed-once"]
+
+    release.set()
+    for _ in range(100):
+        if first.qsize() == 0:
+            break
+        await asyncio.sleep(0.01)
+    await first.stop()
+    await second.stop()
+    assert first.qsize() == 0
+
+
+async def test_expired_lease_recovers_work_abandoned_by_crashed_worker(tmp_path):
+    db_path = tmp_path / "incidents.db"
+    abandoned = asyncio.Event()
+
+    async def crashing_handler(alert: Alert) -> None:
+        abandoned.set()
+        raise asyncio.CancelledError
+
+    first = AlertQueue(
+        handler=crashing_handler,
+        db_path=db_path,
+        lease_seconds=0.25,
+    )
+    await first.submit(_alert("recover-expired-lease"))
+    first.start()
+    await asyncio.wait_for(abandoned.wait(), timeout=1)
+
+    recovered: list[str] = []
+
+    async def recovery_handler(alert: Alert) -> None:
+        recovered.append(alert.id)
+
+    second = AlertQueue(
+        handler=recovery_handler,
+        db_path=db_path,
+        lease_seconds=1,
+    )
+    second.start()
+    await asyncio.sleep(0.1)
+    assert recovered == []
+
+    for _ in range(100):
+        if recovered:
+            break
+        await asyncio.sleep(0.01)
+    await first.stop()
+    await second.stop()
+
+    assert recovered == ["recover-expired-lease"]
+    assert second.qsize() == 0
+
+
+@pytest.mark.parametrize("stale_worker_fails", [False, True])
+async def test_stale_worker_cannot_mutate_alert_reassigned_after_lease_expiry(
+    tmp_path, stale_worker_fails
+):
+    db_path = tmp_path / "incidents.db"
+    first_entered = asyncio.Event()
+    first_release = asyncio.Event()
+    second_entered = asyncio.Event()
+    second_release = asyncio.Event()
+
+    async def first_handler(alert: Alert) -> None:
+        first_entered.set()
+        await first_release.wait()
+        if stale_worker_fails:
+            raise RuntimeError("stale failure")
+
+    async def second_handler(alert: Alert) -> None:
+        second_entered.set()
+        await second_release.wait()
+
+    first = AlertQueue(
+        handler=first_handler,
+        db_path=db_path,
+        lease_seconds=0.05,
+    )
+    second = AlertQueue(
+        handler=second_handler,
+        db_path=db_path,
+        lease_seconds=1,
+    )
+    await first.submit(_alert("reassigned"))
+    first.start()
+    await asyncio.wait_for(first_entered.wait(), timeout=1)
+    second.start()
+    await asyncio.wait_for(second_entered.wait(), timeout=1)
+
+    first_release.set()
+    await asyncio.wait_for(first.stop(), timeout=1)
+
+    with closing(sqlite3.connect(db_path)) as conn:
+        row = conn.execute(
+            """
+            SELECT attempt_count, last_error, lease_token, lease_expires_at
+            FROM alert_queue
+            WHERE alert_id = ?
+            """,
+            ("reassigned",),
+        ).fetchone()
+    assert row is not None
+    assert row[0:2] == (0, None)
+    assert row[2]
+    assert row[3] > 0
+
+    second_release.set()
+    for _ in range(100):
+        if second.qsize() == 0:
+            break
+        await asyncio.sleep(0.01)
+    await second.stop()
+    assert second.qsize() == 0
 
 
 async def test_durable_queue_dead_letters_after_maximum_attempts(tmp_path):
@@ -379,3 +520,8 @@ def test_dead_letters_survive_queue_restart_and_stay_out_of_depth(tmp_path):
 def test_max_attempts_must_be_positive():
     with pytest.raises(ValueError, match="max_attempts must be positive"):
         AlertQueue(handler=lambda alert: None, max_attempts=0)
+
+
+def test_lease_seconds_must_be_positive():
+    with pytest.raises(ValueError, match="lease_seconds must be positive"):
+        AlertQueue(handler=lambda alert: None, lease_seconds=0)
