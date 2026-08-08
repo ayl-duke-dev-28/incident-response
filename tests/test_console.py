@@ -15,6 +15,8 @@ from incident_response.models import (
     ImpactEstimate,
     Incident,
     IncidentStatus,
+    ExternalReference,
+    OnCallResponder,
     Runbook,
     RunbookMatch,
     SuspectCommit,
@@ -418,6 +420,45 @@ def test_console_incident_detail_uses_sse_while_triage_is_in_progress(
     assert 'data-incident-id="inc-auto-refresh"' in response.text
     assert '<script src="/static/console.js" defer></script>' in response.text
     assert 'role="status"' in response.text
+
+
+def test_console_incident_detail_shows_on_call_and_ticket_references(
+    tmp_path, runbooks_dir, alert
+):
+    settings = _settings(tmp_path, runbooks_dir)
+    incident = _incident(
+        incident_id="inc-ownership",
+        alert=alert,
+        status=IncidentStatus.INVESTIGATING,
+        created_at=datetime(2026, 7, 2, 21, 5, tzinfo=timezone.utc),
+    ).model_copy(
+        update={
+            "on_call": [
+                OnCallResponder(
+                    provider="pagerduty",
+                    user_id="PUSER",
+                    name="Alex Operator",
+                    email="alex@example.com",
+                    schedule="Checkout Primary",
+                )
+            ],
+            "external_references": [
+                ExternalReference(
+                    provider="jira",
+                    external_id="OPS-42",
+                    url="https://company.atlassian.net/browse/OPS-42",
+                )
+            ],
+        }
+    )
+    IncidentStore(settings.db_path).save(incident)
+
+    with TestClient(create_app(settings=settings, llm=FakeLLM([]))) as client:
+        response = client.get("/console/incidents/inc-ownership")
+
+    assert "Alex Operator" in response.text
+    assert "Checkout Primary" in response.text
+    assert 'href="https://company.atlassian.net/browse/OPS-42"' in response.text
 
 
 @pytest.mark.parametrize(
