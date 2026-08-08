@@ -208,6 +208,25 @@ class _DurableAlertStore:
             )
             return cursor.rowcount == 1
 
+    def renew_lease(
+        self,
+        alert_id: str,
+        *,
+        lease_token: str,
+        now: float,
+        lease_seconds: float,
+    ) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE alert_queue
+                SET lease_expires_at = ?
+                WHERE alert_id = ? AND lease_token = ?
+                """,
+                (now + lease_seconds, alert_id, lease_token),
+            )
+            return cursor.rowcount == 1
+
     def record_failure(
         self,
         alert_id: str,
@@ -421,8 +440,22 @@ class AlertQueue:
                 alert = claimed.alert
                 alert_id = alert.id
                 lease_token = claimed.lease_token
+            heartbeat: asyncio.Task[None] | None = None
+            if alert_id is not None and lease_token is not None:
+                heartbeat = asyncio.create_task(
+                    self._renew_lease(alert_id, lease_token),
+                    name=f"lease-heartbeat-{alert_id}",
+                )
             try:
-                await self._handler(alert)
+                try:
+                    await self._handler(alert)
+                finally:
+                    if heartbeat is not None:
+                        heartbeat.cancel()
+                        try:
+                            await heartbeat
+                        except asyncio.CancelledError:
+                            pass
             except Exception as exc:
                 logger.exception("worker_handler_failed", extra={"alert_id": alert.id})
                 if alert_id is not None and lease_token is not None:
@@ -448,6 +481,31 @@ class AlertQueue:
             finally:
                 if queued_item:
                     self._queue.task_done()
+
+    async def _renew_lease(self, alert_id: str, lease_token: str) -> None:
+        assert self._store is not None
+        interval = self._lease_seconds / 3
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                renewed = self._store.renew_lease(
+                    alert_id,
+                    lease_token=lease_token,
+                    now=time.time(),
+                    lease_seconds=self._lease_seconds,
+                )
+            except Exception:
+                logger.exception(
+                    "alert_lease_renewal_failed",
+                    extra={"alert_id": alert_id},
+                )
+                return
+            if not renewed:
+                logger.warning(
+                    "alert_lease_ownership_lost",
+                    extra={"alert_id": alert_id},
+                )
+                return
 
     def qsize(self) -> int:
         if self._store is not None:
