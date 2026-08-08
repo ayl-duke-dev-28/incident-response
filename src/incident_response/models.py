@@ -1,5 +1,7 @@
 """Domain models. All values are immutable — use `model_copy(update=...)` to derive new ones."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -180,6 +182,8 @@ class Incident(BaseModel):
     timeline: list[dict[str, Any]] = Field(default_factory=list)
     verification_outcome: VerificationOutcome | None = None
     remediation: RemediationRequest | None = None
+    on_call: list[OnCallResponder] = Field(default_factory=list)
+    external_references: list[ExternalReference] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -187,6 +191,25 @@ class CorrelationResult:
     incident: Incident
     created: bool
     duplicate: bool
+
+
+class OnCallResponder(BaseModel):
+    model_config = {"frozen": True}
+
+    provider: str
+    user_id: str
+    name: str
+    email: str = ""
+    schedule: str = ""
+    escalation_level: int = 1
+
+
+class ExternalReference(BaseModel):
+    model_config = {"frozen": True}
+
+    provider: str
+    external_id: str
+    url: str
 
 
 class MetricPoint(BaseModel):
