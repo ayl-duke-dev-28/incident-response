@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
-from typing import Any, ContextManager, Protocol
+from typing import Any, Callable, ContextManager, Protocol
 from uuid import uuid4
 
 from .models import Alert, Incident, IncidentStatus, RemediationStatus
@@ -26,6 +26,51 @@ class PostgresConnection(Protocol):
 class PostgresDatabaseLike(Protocol):
     def connection(self) -> ContextManager[PostgresConnection]:
         ...
+
+
+class PostgresDatabase:
+    """Own a psycopg connection pool and the production schema lifecycle."""
+
+    def __init__(
+        self,
+        database_url: str,
+        *,
+        pool_factory: Callable[..., Any] | None = None,
+        row_factory: object | None = None,
+    ) -> None:
+        prefix = "postgresql+psycopg://"
+        if not database_url.startswith(prefix):
+            raise ValueError("PostgreSQL URL must use the postgresql+psycopg driver")
+        conninfo = "postgresql://" + database_url.removeprefix(prefix)
+        if pool_factory is None or row_factory is None:
+            try:
+                from psycopg.rows import dict_row
+                from psycopg_pool import ConnectionPool
+            except ImportError as exc:
+                raise RuntimeError(
+                    "PostgreSQL requires the production dependencies; "
+                    "install incident-response[production]"
+                ) from exc
+            pool_factory = pool_factory or ConnectionPool
+            row_factory = row_factory or dict_row
+        self._pool = pool_factory(
+            conninfo,
+            open=False,
+            kwargs={"row_factory": row_factory},
+        )
+
+    def open(self, *, timeout: float = 30.0) -> None:
+        self._pool.open(wait=True, timeout=timeout)
+
+    def migrate(self) -> None:
+        with self.connection() as connection:
+            apply_postgres_migrations(connection)
+
+    def connection(self) -> ContextManager[PostgresConnection]:
+        return self._pool.connection()
+
+    def close(self) -> None:
+        self._pool.close()
 
 
 _FOUNDATION_SCHEMA = """
