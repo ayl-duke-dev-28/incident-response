@@ -13,7 +13,8 @@ Anthropic, GitHub, Slack, and Datadog.
 - Persist accepted alerts to SQLite before returning `202`, then process them in
   a background worker.
 - Recover unfinished alerts when the service restarts.
-- Coordinate workers sharing one SQLite queue with expiring ownership leases.
+- Coordinate workers sharing one SQLite queue with renewable ownership leases
+  and expiry-based crash recovery.
 - Retry failed alert handling automatically with persisted exponential backoff,
   then dead-letter alerts that exhaust the configured attempt limit.
 - Inspect and replay dead-lettered alerts through authenticated operator APIs.
