@@ -13,6 +13,7 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import hmac
 import secrets
 from inspect import isawaitable
 from contextlib import asynccontextmanager
@@ -45,6 +46,7 @@ from .integrations.metrics import build_metrics_client
 from .integrations.slack import build_slack_client
 from .logging_config import configure_logging, set_incident_id, set_trace_id
 from .models import Alert, Incident, IncidentStatus, Severity
+from .normalization import normalize_datadog_alert, normalize_pagerduty_alert
 from .orchestrator import IncidentOrchestrator, OrchestratorConfig
 from .postgres import PostgresAlertStore, PostgresDatabase, PostgresIncidentStore
 from .queue import (
@@ -304,7 +306,10 @@ def create_app(
     async def _verify_inbound(request: Request) -> bytes:
         body = await request.body()
         token = request.headers.get("x-webhook-token", "")
-        token_ok = bool(settings.webhook_token) and token == settings.webhook_token
+        token_ok = bool(settings.webhook_token) and hmac.compare_digest(
+            token,
+            settings.webhook_token,
+        )
 
         dd_sig = request.headers.get("x-datadog-signature", "")
         pd_sig = request.headers.get("x-pagerduty-signature", "")
@@ -318,6 +323,29 @@ def create_app(
 
         # Any one valid credential is enough. Token is the default; HMAC is stronger if set.
         if not (token_ok or hmac_ok):
+            raise HTTPException(status_code=401, detail="Invalid webhook credentials")
+        return body
+
+    async def _verify_provider(request: Request, provider: str) -> bytes:
+        body = await request.body()
+        token = request.headers.get("x-webhook-token", "")
+        token_ok = bool(settings.webhook_token) and hmac.compare_digest(
+            token,
+            settings.webhook_token,
+        )
+        if provider == "datadog":
+            signature_ok = verify_datadog(
+                settings.datadog_webhook_secret,
+                body,
+                request.headers.get("x-datadog-signature", ""),
+            )
+        else:
+            signature_ok = verify_pagerduty(
+                settings.pagerduty_webhook_secret,
+                body,
+                request.headers.get("x-pagerduty-signature", ""),
+            )
+        if not (token_ok or signature_ok):
             raise HTTPException(status_code=401, detail="Invalid webhook credentials")
         return body
 
@@ -484,6 +512,44 @@ def create_app(
         await queue.submit(alert)
         logger.info("alert_enqueued", extra={"alert_id": alert.id, "service": alert.service})
         return {"status": "accepted", "incident_id": incident_id}
+
+    async def _accept_provider_alert(request: Request, provider: str) -> dict[str, str]:
+        await _verify_provider(request, provider)
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be an object")
+            alert = (
+                normalize_datadog_alert(payload)
+                if provider == "datadog"
+                else normalize_pagerduty_alert(payload)
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid {provider} alert payload",
+            ) from exc
+        await _rate_limit(request, alert.service)
+        await queue.submit(alert)
+        incident_id = f"inc-{alert.id}"
+        set_incident_id(incident_id)
+        logger.info(
+            "alert_enqueued",
+            extra={
+                "alert_id": alert.id,
+                "service": alert.service,
+                "provider": provider,
+            },
+        )
+        return {"status": "accepted", "incident_id": incident_id}
+
+    @app.post("/alerts/datadog", status_code=202)
+    async def fire_datadog_alert(request: Request) -> dict[str, str]:
+        return await _accept_provider_alert(request, "datadog")
+
+    @app.post("/alerts/pagerduty", status_code=202)
+    async def fire_pagerduty_alert(request: Request) -> dict[str, str]:
+        return await _accept_provider_alert(request, "pagerduty")
 
     @app.post("/alerts/{incident_id}/resolve")
     async def resolve(
