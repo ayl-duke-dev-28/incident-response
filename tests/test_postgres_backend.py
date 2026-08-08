@@ -12,6 +12,7 @@ from incident_response.models import (
 )
 from incident_response.postgres import (
     PostgresAlertStore,
+    PostgresDatabase,
     PostgresIncidentStore,
     apply_postgres_migrations,
 )
@@ -49,6 +50,23 @@ class RecordingDatabase:
         yield self.connection_value
 
 
+class RecordingPool:
+    def __init__(self, connection: RecordingConnection) -> None:
+        self.connection_value = connection
+        self.open_calls: list[tuple[bool, float]] = []
+        self.closed = False
+
+    def open(self, *, wait: bool, timeout: float) -> None:
+        self.open_calls.append((wait, timeout))
+
+    @contextmanager
+    def connection(self):
+        yield self.connection_value
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _alert() -> Alert:
     return Alert(
         id="pg-alert",
@@ -70,6 +88,36 @@ def test_postgres_migrations_are_versioned_and_create_all_foundation_tables():
     assert "alert_queue" in sql
     assert "alert_dead_letters" in sql
     assert any("INSERT INTO schema_migrations" in statement for statement, _ in connection.calls)
+
+
+def test_postgres_database_owns_pool_lifecycle_and_runs_migrations():
+    connection = RecordingConnection()
+    pool = RecordingPool(connection)
+    factory_calls = []
+
+    def pool_factory(conninfo, **kwargs):
+        factory_calls.append((conninfo, kwargs))
+        return pool
+
+    database = PostgresDatabase(
+        "postgresql+psycopg://app:secret@db/incidents",
+        pool_factory=pool_factory,
+        row_factory="dict_row",
+    )
+
+    database.open(timeout=7)
+    database.migrate()
+    database.close()
+
+    assert factory_calls == [
+        (
+            "postgresql://app:secret@db/incidents",
+            {"open": False, "kwargs": {"row_factory": "dict_row"}},
+        )
+    ]
+    assert pool.open_calls == [(True, 7)]
+    assert any("schema_migrations" in statement for statement, _ in connection.calls)
+    assert pool.closed is True
 
 
 def test_postgres_queue_claims_due_work_with_skip_locked():
