@@ -13,6 +13,7 @@ Anthropic, GitHub, Slack, and Datadog.
 - Persist accepted alerts to SQLite before returning `202`, then process them in
   a background worker.
 - Recover unfinished alerts when the service restarts.
+- Coordinate workers sharing one SQLite queue with expiring ownership leases.
 - Retry failed alert handling automatically with persisted exponential backoff,
   then dead-letter alerts that exhaust the configured attempt limit.
 - Inspect and replay dead-lettered alerts through authenticated operator APIs.
@@ -412,18 +413,23 @@ Queue lifecycle:
 
 1. `submit()` inserts the alert with `INSERT OR IGNORE`; one pending alert ID
    occupies one row.
-2. The in-process worker wakes immediately for new submissions and polls SQLite
-   for unfinished rows after startup.
-3. Successful handling deletes the row.
-4. Failed handling increments `attempt_count`, stores up to 500 characters of
-   `last_error`, and schedules `next_attempt_at`.
-5. The delay is `base × 2^(attempt-1)`, capped by the configured maximum. The
+2. A worker wakes immediately for new submissions and polls SQLite for due rows
+   after startup.
+3. Before handling an alert, the worker atomically claims it with a unique token
+   and a `lease_expires_at` timestamp. Other workers skip the row while that
+   lease is active; an abandoned row becomes claimable after expiry.
+4. Successful handling deletes the row only when the worker still owns its
+   lease. A stale worker cannot delete work that another worker reclaimed.
+5. Failed handling with the current lease increments `attempt_count`, stores up
+   to 500 characters of `last_error`, schedules `next_attempt_at`, and releases
+   the lease.
+6. The delay is `base × 2^(attempt-1)`, capped by the configured maximum. The
    worker polls SQLite and retries the row when it becomes due.
-6. When `attempt_count` reaches `QUEUE_MAX_ATTEMPTS`, the same transaction copies
+7. When `attempt_count` reaches `QUEUE_MAX_ATTEMPTS`, the same transaction copies
    the payload, final error, attempt count, and failure timestamp into
    `alert_dead_letters` and deletes the active queue row.
-7. Restarting the service preserves both scheduled retries and dead letters, so
-   work recovers without retrying earlier than scheduled.
+8. Restarting the service preserves retry schedules, active leases, and dead
+   letters. Abandoned leased work recovers after its persisted expiry.
 
 `GET /readyz` and the console queue indicator count persisted rows, including
 scheduled retries and work currently being handled but not yet completed. Dead
@@ -448,8 +454,14 @@ unchanged. See the
 [dead-letter replay TDD evidence](docs/testing/durable-alert-queue-slice-5.tdd.md)
 for the tested contract.
 
-This slice assumes one active queue worker per SQLite database. It does not yet
-provide processing leases or atomic cross-process job claims.
+Multiple workers may share one SQLite database. Claims use SQLite write
+transactions, and completion or failure updates require the current lease token.
+`QUEUE_LEASE_SECONDS` defaults to 300 seconds and must exceed the longest
+expected handler run. Leases are not renewed: if a handler runs past expiry,
+another worker can repeat external calls, although the stale worker cannot
+delete, reschedule, or dead-letter the reassigned row. See the
+[processing lease TDD evidence](docs/testing/durable-alert-queue-slice-6.tdd.md)
+for the concurrency and crash-recovery contract.
 
 <!-- END AUTO-GENERATED -->
 
@@ -479,6 +491,7 @@ below are the defaults unless the row says a credential is required.
 | `QUEUE_RETRY_BASE_SECONDS` | `1` | Delay before the first automatic queue retry. |
 | `QUEUE_RETRY_MAX_SECONDS` | `60` | Maximum exponential queue retry delay. Must be at least the base delay. |
 | `QUEUE_MAX_ATTEMPTS` | `5` | Handler failures allowed before an alert is moved to `alert_dead_letters`. Must be positive. |
+| `QUEUE_LEASE_SECONDS` | `300` | Queue ownership duration. Must be positive and longer than the longest expected handler run. |
 | `WEBHOOK_TOKEN` | `change-me` | Shared webhook token. |
 | `DATADOG_WEBHOOK_SECRET` | empty | Optional Datadog HMAC secret. |
 | `PAGERDUTY_WEBHOOK_SECRET` | empty | Optional PagerDuty HMAC secret. |
@@ -598,8 +611,9 @@ Important production caveats:
   with a persisted attempt count and exponential delay capped at 60 seconds by
   default. After five failures by default, the alert moves to durable dead-letter
   storage and leaves active queue depth.
-- Run one active queue worker per SQLite database. Cross-process job claiming is
-  a later queue milestone.
+- Queue workers coordinate through persisted claims. Leases are not renewed, so
+  configure `QUEUE_LEASE_SECONDS` above the longest expected handler duration to
+  avoid duplicate external calls after expiry.
 - Rate limit and dedup state are in memory. Use Redis or similar storage for multiple instances.
 - Real LLM mode makes three calls per incident plus one post-mortem call on resolve.
 - Approval and execution completion use atomic SQLite transactions. Concurrent
@@ -649,7 +663,7 @@ pytest
 Current suite:
 
 ```text
-177 passed, no network required
+182 passed, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -736,8 +750,8 @@ frontmatter tags and, optionally, a JSON `## Automated actions` block.
 ## Current Limits
 
 - The durable queue has restart recovery, timed retries, bounded attempts, and
-  authenticated dead-letter listing and replay, but no processing leases or
-  cross-process job claiming.
+  authenticated dead-letter listing and replay plus cross-process claims. It
+  does not renew active processing leases.
 - No Redis-backed rate limit or dedup for multi-instance deployments.
 - No incident merging across services.
 - No on-call rotation lookup.
