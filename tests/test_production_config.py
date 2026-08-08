@@ -19,14 +19,14 @@ def test_development_profile_keeps_local_storage_defaults():
         ({"database_url": "sqlite+aiosqlite:///incidents.db"}, "PostgreSQL"),
         (
             {
-                "database_url": "postgresql+asyncpg://app:secret@db/incidents",
+                "database_url": "postgresql+psycopg://app:secret@db/incidents",
                 "redis_url": "",
             },
             "Redis",
         ),
         (
             {
-                "database_url": "postgresql+asyncpg://app:secret@db/incidents",
+                "database_url": "postgresql+psycopg://app:secret@db/incidents",
                 "redis_url": "redis://redis:6379/0",
             },
             "TLS",
@@ -38,7 +38,7 @@ def test_production_profile_fails_closed_without_secure_shared_services(
 ):
     values = {
         "environment": "production",
-        "database_url": "postgresql+asyncpg://app:secret@db/incidents",
+        "database_url": "postgresql+psycopg://app:secret@db/incidents",
         "redis_url": "rediss://redis:6379/0",
         **overrides,
     }

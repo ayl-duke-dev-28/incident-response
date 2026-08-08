@@ -74,8 +74,10 @@ class Settings(BaseSettings):
     def validate_production_services(self) -> "Settings":
         if self.environment != "production":
             return self
-        if not self.database_url.startswith("postgresql+"):
-            raise ValueError("Production requires a PostgreSQL DATABASE_URL")
+        if not self.database_url.startswith("postgresql+psycopg://"):
+            raise ValueError(
+                "Production requires a PostgreSQL DATABASE_URL using postgresql+psycopg://"
+            )
         if not self.redis_url:
             raise ValueError("Production requires a Redis REDIS_URL")
         if self.redis_require_tls and not self.redis_url.startswith("rediss://"):

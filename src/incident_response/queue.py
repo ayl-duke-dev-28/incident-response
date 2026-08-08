@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Iterator
+from typing import Awaitable, Callable, Iterator, Protocol
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -49,6 +49,44 @@ class DeadLetter(BaseModel):
 class _ClaimedAlert:
     alert: Alert
     lease_token: str
+
+
+class DurableAlertStore(Protocol):
+    def enqueue(self, alert: Alert) -> bool: ...
+
+    def claim(
+        self, alert_id: str, *, now: float, lease_seconds: float
+    ) -> _ClaimedAlert | None: ...
+
+    def claim_next(self, *, now: float, lease_seconds: float) -> _ClaimedAlert | None: ...
+
+    def delete(self, alert_id: str, *, lease_token: str) -> bool: ...
+
+    def renew_lease(
+        self,
+        alert_id: str,
+        *,
+        lease_token: str,
+        now: float,
+        lease_seconds: float,
+    ) -> bool: ...
+
+    def record_failure(
+        self,
+        alert_id: str,
+        *,
+        lease_token: str,
+        error: str,
+        base_seconds: float,
+        max_seconds: float,
+        max_attempts: int,
+    ) -> bool: ...
+
+    def count(self) -> int: ...
+
+    def list_dead_letters(self, limit: int) -> list[DeadLetter]: ...
+
+    def replay_dead_letter(self, alert_id: str) -> Alert: ...
 
 _QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS alert_queue (
@@ -356,6 +394,7 @@ class AlertQueue:
         handler: AlertHandler,
         maxsize: int = 1000,
         db_path: Path | None = None,
+        store: DurableAlertStore | None = None,
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 60.0,
         max_attempts: int = 5,
@@ -369,9 +408,11 @@ class AlertQueue:
             raise ValueError("max_attempts must be positive")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if db_path is not None and store is not None:
+            raise ValueError("db_path and store are mutually exclusive")
         self._handler = handler
         self._queue: asyncio.Queue[Alert | str] = asyncio.Queue(maxsize=maxsize)
-        self._store = _DurableAlertStore(db_path) if db_path is not None else None
+        self._store = store or (_DurableAlertStore(db_path) if db_path is not None else None)
         self._retry_base_seconds = retry_base_seconds
         self._retry_max_seconds = retry_max_seconds
         self._max_attempts = max_attempts

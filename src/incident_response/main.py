@@ -34,6 +34,7 @@ from .integrations.slack import build_slack_client
 from .logging_config import configure_logging, set_incident_id, set_trace_id
 from .models import Alert, Incident, IncidentStatus, Severity
 from .orchestrator import IncidentOrchestrator, OrchestratorConfig
+from .postgres import PostgresAlertStore, PostgresDatabase, PostgresIncidentStore
 from .queue import (
     AlertAlreadyQueuedError,
     AlertQueue,
@@ -63,6 +64,7 @@ def build_orchestrator(
     llm: LLM | None = None,
     *,
     dedup: DedupIndex | RedisDedupIndex | None = None,
+    store: IncidentStore | PostgresIncidentStore | None = None,
 ) -> IncidentOrchestrator:
     if llm is None:
         if settings.llm_mode == "mock":
@@ -86,7 +88,7 @@ def build_orchestrator(
     metrics = build_metrics_client(
         settings.metrics_mode, settings.datadog_api_key, settings.datadog_app_key
     )
-    store = IncidentStore(settings.db_path)
+    store = store or IncidentStore(settings.db_path)
     dedup = dedup or DedupIndex(ttl_seconds=settings.dedup_ttl_seconds)
     executor = build_executor(settings)
 
@@ -142,6 +144,7 @@ def create_app(
     llm: LLM | None = None,
     *,
     redis_client: Any | None = None,
+    postgres_database: Any | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings.log_level)
@@ -177,10 +180,26 @@ def create_app(
             window_seconds=settings.rate_limit_window_seconds,
         )
 
-    orchestrator = build_orchestrator(settings, llm=llm, dedup=dedup)
+    if settings.database_url:
+        postgres_database = postgres_database or PostgresDatabase(settings.database_url)
+        incident_store = PostgresIncidentStore(postgres_database)
+        queue_store = PostgresAlertStore(postgres_database)
+        queue_db_path = None
+    else:
+        incident_store = IncidentStore(settings.db_path)
+        queue_store = None
+        queue_db_path = settings.db_path
+
+    orchestrator = build_orchestrator(
+        settings,
+        llm=llm,
+        dedup=dedup,
+        store=incident_store,
+    )
     queue = AlertQueue(
         handler=orchestrator.handle_alert,
-        db_path=settings.db_path,
+        db_path=queue_db_path,
+        store=queue_store,
         retry_base_seconds=settings.queue_retry_base_seconds,
         retry_max_seconds=settings.queue_retry_max_seconds,
         max_attempts=settings.queue_max_attempts,
@@ -188,6 +207,9 @@ def create_app(
     )
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if postgres_database is not None:
+            postgres_database.open()
+            postgres_database.migrate()
         queue.start()
         logger.info("app_started", extra={"worker": "alert-queue"})
         try:
@@ -196,6 +218,8 @@ def create_app(
             await queue.stop()
             if owns_redis:
                 await redis_client.aclose()
+            if postgres_database is not None:
+                postgres_database.close()
             logger.info("app_stopped")
 
     app = FastAPI(title="Autonomous Incident Response", version="0.2.0", lifespan=lifespan)
@@ -205,6 +229,7 @@ def create_app(
     app.state.queue = queue
     app.state.limiter = limiter
     app.state.redis = redis_client
+    app.state.postgres_database = postgres_database
     app.state.settings = settings
 
     @app.middleware("http")
