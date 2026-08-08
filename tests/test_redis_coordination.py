@@ -1,4 +1,10 @@
+from datetime import datetime, timezone
+
+from fastapi.testclient import TestClient
+
+from incident_response.config import Settings
 from incident_response.dedup import RedisDedupIndex
+from incident_response.main import create_app
 from incident_response.rate_limit import RedisSlidingWindowRateLimiter
 
 
@@ -26,6 +32,9 @@ class FakeRedis:
         self.values.pop(key, None)
         self.expirations.pop(key, None)
         return int(existed)
+
+    async def aclose(self) -> None:
+        pass
 
 
 async def test_redis_rate_limit_uses_one_atomic_script_and_shared_namespace():
@@ -76,3 +85,37 @@ async def test_redis_dedup_is_shared_expiring_namespaced_and_clearable():
 
     await second.forget("fingerprint")
     assert await first.get("fingerprint") is None
+
+
+def test_two_app_instances_share_redis_rate_limit(tmp_path, runbooks_dir):
+    redis = FakeRedis()
+    redis.eval_results = [[1, 0], [0, 0]]
+    common = {
+        "llm_mode": "mock",
+        "runbooks_dir": runbooks_dir,
+        "redis_url": "redis://redis:6379/0",
+        "redis_require_tls": False,
+        "rate_limit_max": 1,
+        "webhook_token": "test-token",
+    }
+    first = create_app(
+        Settings(_env_file=None, db_path=tmp_path / "first.db", **common),
+        redis_client=redis,
+    )
+    second = create_app(
+        Settings(_env_file=None, db_path=tmp_path / "second.db", **common),
+        redis_client=redis,
+    )
+    payload = {
+        "id": "shared-limit",
+        "title": "Checkout failures",
+        "service": "checkout",
+        "severity": "sev2",
+        "triggered_at": datetime.now(timezone.utc).isoformat(),
+    }
+    headers = {"x-webhook-token": "test-token"}
+
+    with TestClient(first, client=("10.0.0.1", 5000)) as first_client:
+        assert first_client.post("/alerts", json=payload, headers=headers).status_code == 202
+    with TestClient(second, client=("10.0.0.1", 5001)) as second_client:
+        assert second_client.post("/alerts", json=payload, headers=headers).status_code == 429
