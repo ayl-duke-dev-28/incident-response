@@ -189,6 +189,30 @@ def test_postgres_remediation_decision_locks_latest_incident_row():
     assert any("FOR UPDATE" in statement for statement, _ in connection.calls)
 
 
+def test_postgres_correlation_uses_transaction_lock_and_unique_event_identity():
+    now = datetime.now(timezone.utc)
+    alert = _alert().model_copy(
+        update={
+            "source": "datadog",
+            "provider_event_id": "event-1",
+            "correlation_key": "checkout-prod",
+        }
+    )
+    candidate = Incident(id=f"inc-{alert.id}", alert=alert, created_at=now)
+    connection = RecordingConnection(
+        results=[Result(), Result(one=None), Result(one=None), Result(), Result(), Result()]
+    )
+    store = PostgresIncidentStore(RecordingDatabase(connection))
+
+    result = store.correlate_alert(alert, candidate, merge_window_minutes=15)
+
+    sql = " ".join(statement for statement, _ in connection.calls)
+    assert result.created is True
+    assert "pg_advisory_xact_lock" in sql
+    assert "incident_alerts" in sql
+    assert "incident_correlations" in sql
+
+
 def test_production_app_uses_postgres_stores_and_manages_database_lifecycle(
     runbooks_dir,
 ):
