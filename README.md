@@ -6,6 +6,32 @@ It is built as a local-first FastAPI service with deterministic mock adapters an
 a production profile backed by PostgreSQL, Redis, OIDC, PagerDuty, Jira, and
 Linear.
 
+## Production Readiness
+
+The production profile now supports multi-instance operation with PostgreSQL
+storage and Redis coordination, generic OIDC authentication with role-based
+access control, CSRF protection, hashed bearer tokens, provider-specific alert
+normalization and correlation, PagerDuty on-call lookup, Jira and Linear ticket
+creation through a transactional outbox, and authenticated server-sent console
+updates. Secure headers and loopback-first CLI defaults are enabled without
+removing the zero-service local mock workflow.
+
+<!-- AUTO-GENERATED: verification snapshot -->
+Validated on 2026-08-08:
+
+- `pytest`: 239 tests passed with 86% coverage and no network required.
+- `ruff check .`, Python bytecode compilation, and `git diff --check`: clean.
+- Browser QA covered demo creation, live `EventSource` updates, completed triage,
+  remediation rejection, persisted on-call ownership, and persisted ticket
+  references with no console errors.
+- The offline CLI demo completed the alert-to-post-mortem path.
+<!-- END AUTO-GENERATED: verification snapshot -->
+
+Deployment-specific validation against live PostgreSQL, Redis, OIDC, PagerDuty,
+Jira, and Linear instances still requires the target environment and its
+credentials. See [Production Architecture](docs/production-architecture.md) for
+the runtime topology and failure model.
+
 ## What You Can Do
 
 - Receive normalized Datadog, PagerDuty, or generic webhook alerts through
@@ -757,7 +783,7 @@ pytest
 Current suite:
 
 ```text
-182 passed, no network required
+239 passed, 86% coverage, no network required
 ```
 
 Feature-level TDD evidence is recorded in [`docs/testing/`](docs/testing/).
@@ -789,20 +815,24 @@ curl -i -X POST \
 
 ```text
 src/incident_response/
-  cli.py               CLI for serve and offline demo
+  auth.py              OIDC sessions, RBAC, CSRF, and hashed bearer tokens
+  cli.py               Loopback-first server CLI and offline demo
+  config.py            Validated development and production settings
+  console.py           Authenticated server-rendered operator console
+  db.py                SQLite persistence and storage interfaces
+  dedup.py             Local alert fingerprinting and TTL deduplication
   demo.py              Shared typed alert scenario for CLI and console demos
-  main.py              FastAPI app, lifespan worker, auth, rate limit, dedup
-  console.py           Server-rendered operator console (HTML, no template engine)
-  orchestrator.py      Alert -> triage -> brief -> remediate -> resolve -> post-mortem
+  events.py            Local and Redis-backed incident event publishing
+  main.py              FastAPI routes, lifespan workers, and dependency wiring
   models.py            Pydantic domain models
-  db.py                SQLite persistence
-  config.py            Env-driven settings
-  queue.py             SQLite-backed alert queue and async worker
-  dedup.py             Alert fingerprinting and TTL LRU
-  rate_limit.py        Sliding-window rate limiter
-  security.py          Datadog, PagerDuty, and generic HMAC verification
-  retry.py             Exponential backoff with jitter
-  executor.py          Mock and shell remediation executors
+  normalization.py     Datadog, PagerDuty, and generic alert normalization
+  orchestrator.py      Alert -> triage -> brief -> remediate -> post-mortem
+  outbox.py            Durable, leased Jira and Linear delivery worker
+  postgres.py          PostgreSQL incidents, queue, correlation, and outbox
+  queue.py             Durable alert queue and renewable worker leases
+  rate_limit.py        Local and Redis-backed rate limiting
+  security.py          Webhook signature verification and security headers
+  executor.py          Mock and allow-listed shell remediation executors
   history.py           Past post-mortem retrieval
   pr_annotation.py     Deterministic PR comment composer
   verification.py      Post-remediation metric polling
@@ -818,10 +848,13 @@ src/incident_response/
     postmortem.py      Post-mortem generation
   integrations/
     github.py          Mock and REST GitHub clients
-    slack.py           Mock, webhook, and bot-token Slack clients
     metrics.py         Mock and Datadog metrics clients
+    on_call.py         Mock and PagerDuty on-call lookup
+    slack.py           Mock, webhook, and bot-token Slack clients
+    tickets.py         Mock, Jira, and Linear ticket clients
   static/
     console.css        Console stylesheet, served at /static
+    console.js         Authenticated SSE console updates
 
 tests/                 Pytest suite
 runbooks/              Example runbooks
