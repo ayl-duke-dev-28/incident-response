@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     oidc_viewer_groups: str = "incident-viewers"
     oidc_responder_groups: str = "incident-responders"
     oidc_admin_groups: str = "incident-admins"
+    operator_bearer_tokens: str = ""
 
     # Durable alert queue retry schedule
     queue_retry_base_seconds: float = 1.0

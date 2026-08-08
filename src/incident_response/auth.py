@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
+import json
 import secrets
 import time
 from collections.abc import Callable, Mapping, Set
@@ -131,12 +133,41 @@ class AuthPolicy:
         return isinstance(expected, str) and hmac.compare_digest(expected, supplied)
 
 
+def parse_bearer_token_roles(value: str) -> dict[str, Role]:
+    """Parse a JSON mapping of SHA-256 token digests to operator roles."""
+    if not value.strip():
+        return {}
+    raw = json.loads(value)
+    if not isinstance(raw, dict):
+        raise ValueError("Operator bearer tokens must be a JSON object")
+    parsed: dict[str, Role] = {}
+    for digest, role_value in raw.items():
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("Operator bearer token keys must be lowercase SHA-256 digests")
+        try:
+            parsed[digest] = Role(role_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Operator bearer token roles must be viewer, responder, or admin") from exc
+    return parsed
+
+
 class AuthContext:
     """Resolve signed sessions and enforce route roles without trusting form identity."""
 
-    def __init__(self, *, enabled: bool, policy: AuthPolicy) -> None:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        policy: AuthPolicy,
+        bearer_token_roles: Mapping[str, Role] | None = None,
+    ) -> None:
         self.enabled = enabled
         self.policy = policy
+        self._bearer_token_roles = dict(bearer_token_roles or {})
         self._development_principal = Principal(
             subject="local-development",
             email="local-development",
@@ -149,6 +180,22 @@ class AuthContext:
             return self._development_principal
         return self.policy.principal_from_session(request.session)
 
+    def bearer_principal(self, request: Request) -> Principal | None:
+        authorization = request.headers.get("authorization", "")
+        scheme, separator, token = authorization.partition(" ")
+        if not separator or scheme.lower() != "bearer" or not token:
+            return None
+        supplied_digest = hashlib.sha256(token.encode()).hexdigest()
+        for configured_digest, role in self._bearer_token_roles.items():
+            if hmac.compare_digest(configured_digest, supplied_digest):
+                return Principal(
+                    subject=f"api-token:{configured_digest[:12]}",
+                    email="",
+                    name="Operator API token",
+                    role=role,
+                )
+        return None
+
     async def require(
         self,
         request: Request,
@@ -157,6 +204,11 @@ class AuthContext:
         csrf: bool = False,
         redirect_to_login: bool = False,
     ) -> Principal:
+        bearer_principal = self.bearer_principal(request) if self.enabled else None
+        if bearer_principal is not None:
+            if not bearer_principal.permits(role):
+                raise HTTPException(status_code=403, detail="Insufficient role")
+            return bearer_principal
         principal = self.principal(request)
         if principal is None:
             if redirect_to_login:

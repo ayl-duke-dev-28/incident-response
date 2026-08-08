@@ -1,3 +1,6 @@
+import hashlib
+import json
+
 from fastapi.responses import RedirectResponse
 from fastapi.testclient import TestClient
 
@@ -164,3 +167,36 @@ def test_admin_can_reach_privileged_operator_actions(tmp_path, runbooks_dir):
 
     assert replay.status_code == 404
     assert approve.status_code == 404
+
+
+def test_hashed_bearer_token_authorizes_operator_api_without_csrf(tmp_path, runbooks_dir):
+    token = "responder-api-token"
+    settings = _settings(tmp_path, runbooks_dir)
+    settings.operator_bearer_tokens = json.dumps(
+        {hashlib.sha256(token.encode()).hexdigest(): "responder"}
+    )
+    app = create_app(
+        settings,
+        oidc_client=FakeOIDCClient(["incident-viewers"]),
+        auth_policy=_policy(),
+    )
+
+    with TestClient(app) as client:
+        read = client.get(
+            "/incidents",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        resolve = client.post(
+            "/alerts/missing/resolve",
+            json={"resolution_note": "fixed"},
+            headers={"authorization": f"Bearer {token}"},
+        )
+        approve = client.post(
+            "/alerts/missing/remediation/approve",
+            json={"decided_by": "ignored"},
+            headers={"authorization": f"Bearer {token}"},
+        )
+
+    assert read.status_code == 200
+    assert resolve.status_code == 404
+    assert approve.status_code == 403

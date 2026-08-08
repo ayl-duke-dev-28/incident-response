@@ -33,6 +33,7 @@ from .auth import (
     Role,
     build_oidc_client,
     csv_groups,
+    parse_bearer_token_roles,
 )
 from .config import Settings, load_settings
 from .console import STATIC_DIR, register_console
@@ -170,7 +171,11 @@ def create_app(
         groups_claim=settings.oidc_groups_claim,
         session_seconds=settings.session_seconds,
     )
-    auth = AuthContext(enabled=settings.auth_mode == "oidc", policy=auth_policy)
+    auth = AuthContext(
+        enabled=settings.auth_mode == "oidc",
+        policy=auth_policy,
+        bearer_token_roles=parse_bearer_token_roles(settings.operator_bearer_tokens),
+    )
     if auth.enabled and oidc_client is None:
         oidc_client = build_oidc_client(settings)
 
