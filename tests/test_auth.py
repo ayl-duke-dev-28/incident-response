@@ -1,7 +1,18 @@
+import asyncio
+import hashlib
+
 import pytest
 from pydantic import ValidationError
+from starlette.requests import Request
 
-from incident_response.auth import AuthPolicy, Principal, Role, role_for_groups
+from incident_response.auth import (
+    AuthContext,
+    AuthPolicy,
+    Principal,
+    Role,
+    parse_bearer_token_roles,
+    role_for_groups,
+)
 from incident_response.config import Settings
 
 
@@ -150,3 +161,40 @@ def test_oidc_session_rejects_missing_subject_or_authorized_role():
         policy.session_from_oidc_token(
             {"userinfo": {"sub": "outsider", "groups": ["engineering"]}}
         )
+
+
+def test_hashed_bearer_token_authenticates_without_storing_plaintext():
+    token = "production-api-token"
+    digest = hashlib.sha256(token.encode()).hexdigest()
+    context = AuthContext(
+        enabled=True,
+        policy=AuthPolicy(
+            viewer_groups=set(),
+            responder_groups=set(),
+            admin_groups=set(),
+        ),
+        bearer_token_roles={digest: Role.RESPONDER},
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/incidents/id/resolve",
+            "headers": [(b"authorization", f"Bearer {token}".encode())],
+        }
+    )
+
+    principal = asyncio.run(context.require(request, Role.RESPONDER, csrf=True))
+
+    assert principal.role is Role.RESPONDER
+    assert token not in principal.subject
+
+
+def test_bearer_token_role_config_is_strict_json_hash_mapping():
+    digest = "a" * 64
+
+    assert parse_bearer_token_roles(f'{{"{digest}": "admin"}}') == {
+        digest: Role.ADMIN
+    }
+    with pytest.raises(ValueError, match="SHA-256"):
+        parse_bearer_token_roles('{"plaintext": "admin"}')
