@@ -108,6 +108,7 @@ def test_postgres_migrations_are_versioned_and_create_all_foundation_tables():
     assert "alert_dead_letters" in sql
     assert "incident_alerts" in sql
     assert "incident_correlations" in sql
+    assert "outbox" in sql
     assert any("INSERT INTO schema_migrations" in statement for statement, _ in connection.calls)
 
 
@@ -211,6 +212,34 @@ def test_postgres_correlation_uses_transaction_lock_and_unique_event_identity():
     assert "pg_advisory_xact_lock" in sql
     assert "incident_alerts" in sql
     assert "incident_correlations" in sql
+
+
+def test_postgres_outbox_claims_due_messages_with_skip_locked():
+    connection = RecordingConnection(
+        results=[
+            Result(
+                one={
+                    "id": "message-1",
+                    "aggregate_id": "inc-pg-alert",
+                    "destination": "jira",
+                    "idempotency_key": "incident:inc-pg-alert:ticket:jira",
+                    "status": "pending",
+                    "attempt_count": 0,
+                    "next_attempt_at": 0,
+                    "lease_token": None,
+                    "lease_expires_at": None,
+                }
+            ),
+            Result(),
+        ]
+    )
+    store = PostgresIncidentStore(RecordingDatabase(connection))
+
+    claimed = store.claim_outbox(now=100, lease_seconds=30)
+
+    assert claimed is not None
+    assert claimed.destination == "jira"
+    assert any("FOR UPDATE SKIP LOCKED" in statement for statement, _ in connection.calls)
 
 
 def test_production_app_uses_postgres_stores_and_manages_database_lifecycle(
