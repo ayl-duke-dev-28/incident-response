@@ -395,7 +395,7 @@ def test_console_incident_detail_handles_triage_in_progress(tmp_path, runbooks_d
     assert "No timeline events recorded" in response.text
 
 
-def test_console_incident_detail_auto_refreshes_while_triage_is_in_progress(
+def test_console_incident_detail_uses_sse_while_triage_is_in_progress(
     tmp_path, runbooks_dir, alert
 ):
     settings = _settings(tmp_path, runbooks_dir)
@@ -413,8 +413,10 @@ def test_console_incident_detail_auto_refreshes_while_triage_is_in_progress(
     with TestClient(app) as client:
         response = client.get("/console/incidents/inc-auto-refresh")
 
-    assert '<meta http-equiv="refresh" content="3">' in response.text
-    assert "Refreshing automatically every 3 seconds" in response.text
+    assert 'http-equiv="refresh"' not in response.text
+    assert "Live updates connected" in response.text
+    assert 'data-incident-id="inc-auto-refresh"' in response.text
+    assert '<script src="/static/console.js" defer></script>' in response.text
     assert 'role="status"' in response.text
 
 
@@ -444,6 +446,7 @@ def test_console_incident_detail_stops_auto_refresh_after_triage(
         response = client.get(f"/console/incidents/{incident_id}")
 
     assert 'http-equiv="refresh"' not in response.text
+    assert f'data-incident-id="{incident_id}"' in response.text
     assert "Refreshing automatically" not in response.text
 
 
