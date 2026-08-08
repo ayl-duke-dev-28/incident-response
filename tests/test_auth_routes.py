@@ -30,6 +30,11 @@ class FakeOIDCClient:
         }
 
 
+class FailingOIDCClient(FakeOIDCClient):
+    async def authorize_access_token(self, request):
+        raise RuntimeError("sensitive provider failure")
+
+
 def _settings(tmp_path, runbooks_dir) -> Settings:
     return Settings(
         _env_file=None,
@@ -118,6 +123,21 @@ def test_oidc_callback_rejects_user_without_mapped_group(tmp_path, runbooks_dir)
 
     assert response.status_code == 403
     assert response.json() == {"detail": "OIDC user is not authorized"}
+
+
+def test_oidc_callback_hides_provider_failures(tmp_path, runbooks_dir):
+    app = create_app(
+        _settings(tmp_path, runbooks_dir),
+        oidc_client=FailingOIDCClient(["incident-viewers"]),
+        auth_policy=_policy(),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/auth/callback")
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "OIDC authentication failed"}
+    assert "sensitive provider failure" not in response.text
 
 
 def test_incident_event_stream_requires_operator_authentication(tmp_path, runbooks_dir):
