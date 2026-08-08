@@ -267,6 +267,26 @@ def create_app(
     app.state.settings = settings
 
     @app.middleware("http")
+    async def browser_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; base-uri 'self'; object-src 'none'; "
+            "frame-ancestors 'none'; form-action 'self'; script-src 'self'; "
+            "style-src 'self'; img-src 'self'; connect-src 'self'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "same-origin"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+        )
+        if settings.environment == "production":
+            response.headers["Strict-Transport-Security"] = (
+                "max-age=63072000; includeSubDomains"
+            )
+        return response
+
+    @app.middleware("http")
     async def correlation_middleware(request: Request, call_next):
         set_trace_id(current_trace_id())
         set_incident_id(None)
