@@ -46,10 +46,12 @@ from .integrations.github import build_github_client
 from .integrations.metrics import build_metrics_client
 from .integrations.on_call import OnCallClient, build_on_call_client
 from .integrations.slack import build_slack_client
+from .integrations.tickets import JiraTicketClient, LinearTicketClient, MockTicketClient
 from .logging_config import configure_logging, set_incident_id, set_trace_id
 from .models import Alert, Incident, IncidentStatus, Severity
 from .normalization import normalize_datadog_alert, normalize_pagerduty_alert
 from .orchestrator import IncidentOrchestrator, OrchestratorConfig
+from .outbox import OutboxDispatcher, TicketClient
 from .postgres import PostgresAlertStore, PostgresDatabase, PostgresIncidentStore
 from .queue import (
     AlertAlreadyQueuedError,
@@ -166,6 +168,8 @@ def create_app(
     oidc_client: Any | None = None,
     auth_policy: AuthPolicy | None = None,
     provider_http_client: httpx.AsyncClient | None = None,
+    jira_http_client: httpx.AsyncClient | None = None,
+    linear_http_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings.log_level)
@@ -216,13 +220,54 @@ def create_app(
             window_seconds=settings.rate_limit_window_seconds,
         )
 
+    ticket_clients: dict[str, TicketClient] = {}
+    owned_ticket_http: list[httpx.AsyncClient] = []
+    if settings.jira_mode == "mock":
+        ticket_clients["jira"] = MockTicketClient("jira")
+    elif settings.jira_mode == "jira":
+        if jira_http_client is None:
+            jira_http_client = httpx.AsyncClient(
+                base_url=settings.jira_base_url.rstrip("/"),
+                timeout=10,
+            )
+            owned_ticket_http.append(jira_http_client)
+        ticket_clients["jira"] = JiraTicketClient(
+            base_url=settings.jira_base_url,
+            email=settings.jira_email,
+            api_token=settings.jira_api_token,
+            project_key=settings.jira_project_key,
+            issue_type=settings.jira_issue_type,
+            http=jira_http_client,
+        )
+    if settings.linear_mode == "mock":
+        ticket_clients["linear"] = MockTicketClient("linear")
+    elif settings.linear_mode == "linear":
+        if linear_http_client is None:
+            linear_http_client = httpx.AsyncClient(
+                base_url="https://api.linear.app",
+                timeout=10,
+            )
+            owned_ticket_http.append(linear_http_client)
+        ticket_clients["linear"] = LinearTicketClient(
+            token=settings.linear_api_token,
+            team_id=settings.linear_team_id,
+            http=linear_http_client,
+        )
+    outbox_destinations = tuple(ticket_clients)
+
     if settings.database_url:
         postgres_database = postgres_database or PostgresDatabase(settings.database_url)
-        incident_store = PostgresIncidentStore(postgres_database)
+        incident_store = PostgresIncidentStore(
+            postgres_database,
+            outbox_destinations=outbox_destinations,
+        )
         queue_store = PostgresAlertStore(postgres_database)
         queue_db_path = None
     else:
-        incident_store = IncidentStore(settings.db_path)
+        incident_store = IncidentStore(
+            settings.db_path,
+            outbox_destinations=outbox_destinations,
+        )
         queue_store = None
         queue_db_path = settings.db_path
 
@@ -255,21 +300,34 @@ def create_app(
         max_attempts=settings.queue_max_attempts,
         lease_seconds=settings.queue_lease_seconds,
     )
+    outbox = OutboxDispatcher(
+        store=incident_store,
+        ticket_clients=ticket_clients,
+        max_attempts=settings.outbox_max_attempts,
+        retry_base_seconds=settings.outbox_retry_base_seconds,
+        retry_max_seconds=settings.outbox_retry_max_seconds,
+        lease_seconds=settings.outbox_lease_seconds,
+        poll_seconds=settings.outbox_poll_seconds,
+    )
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if postgres_database is not None:
             postgres_database.open()
             postgres_database.migrate()
         queue.start()
+        outbox.start()
         logger.info("app_started", extra={"worker": "alert-queue"})
         try:
             yield
         finally:
             await queue.stop()
+            await outbox.stop()
             if owns_redis:
                 await redis_client.aclose()
             if owns_provider_http and provider_http_client is not None:
                 await provider_http_client.aclose()
+            for client in owned_ticket_http:
+                await client.aclose()
             if postgres_database is not None:
                 postgres_database.close()
             logger.info("app_stopped")
@@ -288,6 +346,7 @@ def create_app(
 
     app.state.orchestrator = orchestrator
     app.state.queue = queue
+    app.state.outbox = outbox
     app.state.limiter = limiter
     app.state.redis = redis_client
     app.state.postgres_database = postgres_database

@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     linear_mode: Literal["mock", "disabled", "linear"] = "mock"
     linear_api_token: str = ""
     linear_team_id: str = ""
+    outbox_retry_base_seconds: float = 1.0
+    outbox_retry_max_seconds: float = 60.0
+    outbox_max_attempts: int = 5
+    outbox_lease_seconds: float = 60.0
+    outbox_poll_seconds: float = 0.5
 
     # Durable alert queue retry schedule
     queue_retry_base_seconds: float = 1.0

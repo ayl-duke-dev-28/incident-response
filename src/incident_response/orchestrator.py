@@ -340,6 +340,7 @@ class IncidentOrchestrator:
                     ),
                     thread_ts=slack_ts,
                 )
+        self._store.save_with_ticket_outbox(incident)
         return incident
 
     async def approve_remediation(

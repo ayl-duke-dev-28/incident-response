@@ -19,7 +19,7 @@ def test_incident_creation_atomically_enqueues_one_message_per_ticket_provider(t
     store = IncidentStore(tmp_path / "incidents.db", outbox_destinations=("jira", "linear"))
     incident = _incident()
 
-    store.correlate_alert(incident.alert, incident, merge_window_minutes=15)
+    store.save_with_ticket_outbox(incident)
     messages = store.list_outbox()
 
     assert [message.destination for message in messages] == ["jira", "linear"]
@@ -32,7 +32,7 @@ def test_incident_creation_atomically_enqueues_one_message_per_ticket_provider(t
 def test_outbox_claim_completion_persists_external_reference_exactly_once(tmp_path):
     store = IncidentStore(tmp_path / "incidents.db", outbox_destinations=("jira",))
     incident = _incident()
-    store.correlate_alert(incident.alert, incident, merge_window_minutes=15)
+    store.save_with_ticket_outbox(incident)
 
     claimed = store.claim_outbox(now=100, lease_seconds=30)
     assert claimed is not None
@@ -54,7 +54,7 @@ def test_outbox_claim_completion_persists_external_reference_exactly_once(tmp_pa
 async def test_dispatcher_delivers_stable_key_and_bounds_retries(tmp_path):
     store = IncidentStore(tmp_path / "incidents.db", outbox_destinations=("jira",))
     incident = _incident()
-    store.correlate_alert(incident.alert, incident, merge_window_minutes=15)
+    store.save_with_ticket_outbox(incident)
 
     class FailingTickets:
         def __init__(self):

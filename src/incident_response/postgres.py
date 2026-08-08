@@ -278,6 +278,11 @@ class PostgresIncidentStore:
                 (message_id, incident.id, destination, idempotency_key),
             )
 
+    def save_with_ticket_outbox(self, incident: Incident) -> None:
+        with self._database.connection() as connection:
+            self._save_with_conn(connection, incident)
+            self._enqueue_outbox(connection, incident)
+
     @staticmethod
     def _outbox_from_row(row: object) -> OutboxMessage:
         return OutboxMessage(
@@ -367,6 +372,52 @@ class PostgresIncidentStore:
             )
             return result.rowcount == 1
 
+    def record_outbox_failure(
+        self,
+        message: OutboxMessage,
+        *,
+        error: str,
+        now: float,
+        max_attempts: int,
+        retry_base_seconds: float,
+        retry_max_seconds: float,
+    ) -> bool:
+        if not message.lease_token:
+            return False
+        with self._database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT status, lease_token, attempt_count FROM outbox
+                WHERE id = %s FOR UPDATE
+                """,
+                (message.id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "pending"
+                or row["lease_token"] != message.lease_token
+            ):
+                return False
+            attempts = int(row["attempt_count"]) + 1
+            dead = attempts >= max_attempts
+            delay = min(retry_max_seconds, retry_base_seconds * (2 ** (attempts - 1)))
+            result = connection.execute(
+                """
+                UPDATE outbox SET status = %s, attempt_count = %s, next_attempt_at = %s,
+                    last_error = %s, lease_token = NULL, lease_expires_at = NULL
+                WHERE id = %s AND status = 'pending' AND lease_token = %s
+                """,
+                (
+                    "dead" if dead else "pending",
+                    attempts,
+                    now + delay,
+                    error[:2000],
+                    message.id,
+                    message.lease_token,
+                ),
+            )
+            return result.rowcount == 1
+
     def correlate_alert(
         self,
         alert: Alert,
@@ -445,8 +496,6 @@ class PostgresIncidentStore:
                 created = True
 
             self._save_with_conn(connection, incident)
-            if created:
-                self._enqueue_outbox(connection, incident)
             connection.execute(
                 """
                 INSERT INTO incident_correlations
