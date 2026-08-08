@@ -280,6 +280,40 @@ def _render_alert_detail(incident: Incident) -> str:
     )
 
 
+def _render_ownership_and_tickets(incident: Incident) -> str:
+    if not incident.on_call and not incident.external_references:
+        return ""
+    ownership = ""
+    if incident.on_call:
+        responders = "".join(
+            "<li>"
+            f"<strong>{escape(responder.name or responder.user_id)}</strong>"
+            + (f" · {escape(responder.schedule)}" if responder.schedule else "")
+            + (f" · {escape(responder.email)}" if responder.email else "")
+            + "</li>"
+            for responder in incident.on_call
+        )
+        ownership = f"<h3>On-call</h3><ul>{responders}</ul>"
+    tickets = ""
+    if incident.external_references:
+        references: list[str] = []
+        for reference in incident.external_references:
+            parsed = urlsplit(reference.url)
+            label = f"{reference.provider.title()} {reference.external_id}"
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                references.append(
+                    '<li><a target="_blank" rel="noopener noreferrer" '
+                    f'href="{escape(reference.url, quote=True)}">{escape(label)}</a></li>'
+                )
+            else:
+                references.append(f"<li>{escape(label)}</li>")
+        tickets = f"<h3>Tickets</h3><ul>{''.join(references)}</ul>"
+    return (
+        '<section class="detail-section ownership"><h2>Ownership and tickets</h2>'
+        f"{ownership}{tickets}</section>"
+    )
+
+
 def _render_suspects(incident: Incident) -> str:
     triage = incident.triage
     if triage is None:
@@ -505,6 +539,7 @@ def _render_incident_detail(
         )
         + refresh_status
         + _render_alert_detail(incident)
+        + _render_ownership_and_tickets(incident)
         + _render_triage_detail(incident)
         + _render_remediation_approval(incident, settings, csrf_token)
         + _render_timeline(incident)
