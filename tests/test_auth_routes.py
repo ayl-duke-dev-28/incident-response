@@ -120,6 +120,19 @@ def test_oidc_callback_rejects_user_without_mapped_group(tmp_path, runbooks_dir)
     assert response.json() == {"detail": "OIDC user is not authorized"}
 
 
+def test_incident_event_stream_requires_operator_authentication(tmp_path, runbooks_dir):
+    app = create_app(
+        _settings(tmp_path, runbooks_dir),
+        oidc_client=FakeOIDCClient(["incident-viewers"]),
+        auth_policy=_policy(),
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/events/incidents/inc-missing")
+
+    assert response.status_code == 401
+
+
 def test_viewer_can_read_but_cannot_replay_dead_letters(tmp_path, runbooks_dir):
     with _authenticated_client(tmp_path, runbooks_dir, "incident-viewers") as client:
         assert client.get("/incidents").status_code == 200
