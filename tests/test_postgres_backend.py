@@ -241,6 +241,9 @@ def test_production_app_uses_postgres_stores_and_manages_database_lifecycle(
         oidc_client_id="incident-response",
         oidc_client_secret="client-secret",
         oidc_metadata_url="https://identity.example/.well-known/openid-configuration",
+        pagerduty_mode="disabled",
+        jira_mode="disabled",
+        linear_mode="disabled",
         llm_mode="mock",
         runbooks_dir=runbooks_dir,
     )

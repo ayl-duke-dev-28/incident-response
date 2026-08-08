@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
+import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -43,6 +44,7 @@ from .dedup import DedupIndex, RedisDedupIndex
 from .executor import MockExecutor, RemediationExecutor, ShellExecutor
 from .integrations.github import build_github_client
 from .integrations.metrics import build_metrics_client
+from .integrations.on_call import OnCallClient, build_on_call_client
 from .integrations.slack import build_slack_client
 from .logging_config import configure_logging, set_incident_id, set_trace_id
 from .models import Alert, Incident, IncidentStatus, Severity
@@ -79,6 +81,7 @@ def build_orchestrator(
     *,
     dedup: DedupIndex | RedisDedupIndex | None = None,
     store: IncidentStore | PostgresIncidentStore | None = None,
+    on_call: OnCallClient | None = None,
 ) -> IncidentOrchestrator:
     if llm is None:
         if settings.llm_mode == "mock":
@@ -124,6 +127,7 @@ def build_orchestrator(
         config=config,
         dedup=dedup,
         executor=executor,
+        on_call=on_call,
     )
 
 
@@ -161,6 +165,7 @@ def create_app(
     postgres_database: Any | None = None,
     oidc_client: Any | None = None,
     auth_policy: AuthPolicy | None = None,
+    provider_http_client: httpx.AsyncClient | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings.log_level)
@@ -221,11 +226,25 @@ def create_app(
         queue_store = None
         queue_db_path = settings.db_path
 
+    owns_provider_http = False
+    if settings.pagerduty_mode == "pagerduty" and provider_http_client is None:
+        provider_http_client = httpx.AsyncClient(
+            base_url="https://api.pagerduty.com",
+            timeout=10,
+        )
+        owns_provider_http = True
+    on_call = build_on_call_client(
+        mode=settings.pagerduty_mode,
+        token=settings.pagerduty_api_token,
+        service_ids=settings.pagerduty_service_ids,
+        http=provider_http_client,
+    )
     orchestrator = build_orchestrator(
         settings,
         llm=llm,
         dedup=dedup,
         store=incident_store,
+        on_call=on_call,
     )
     queue = AlertQueue(
         handler=orchestrator.handle_alert,
@@ -249,6 +268,8 @@ def create_app(
             await queue.stop()
             if owns_redis:
                 await redis_client.aclose()
+            if owns_provider_http and provider_http_client is not None:
+                await provider_http_client.aclose()
             if postgres_database is not None:
                 postgres_database.close()
             logger.info("app_stopped")

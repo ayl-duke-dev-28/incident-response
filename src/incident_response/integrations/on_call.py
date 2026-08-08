@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from typing import Protocol
 
 import httpx
 
 from ..models import OnCallResponder
+
+
+class OnCallClient(Protocol):
+    async def lookup(self, service: str) -> list[OnCallResponder]:
+        ...
 
 
 class PagerDutyOnCallClient:
@@ -74,3 +81,39 @@ class MockOnCallClient:
                 schedule=f"{service.title()} Primary",
             )
         ]
+
+
+class DisabledOnCallClient:
+    async def lookup(self, service: str) -> list[OnCallResponder]:
+        return []
+
+
+def parse_service_ids(value: str) -> dict[str, str]:
+    if not value.strip():
+        return {}
+    payload = json.loads(value)
+    if not isinstance(payload, dict) or not all(
+        isinstance(key, str) and isinstance(item, str) and key and item
+        for key, item in payload.items()
+    ):
+        raise ValueError("PagerDuty service IDs must be a JSON string mapping")
+    return payload
+
+
+def build_on_call_client(
+    *,
+    mode: str,
+    token: str,
+    service_ids: str,
+    http: httpx.AsyncClient | None,
+) -> OnCallClient:
+    if mode == "mock":
+        return MockOnCallClient()
+    if mode == "disabled":
+        return DisabledOnCallClient()
+    if mode != "pagerduty" or not token or http is None:
+        raise RuntimeError("PagerDuty mode requires an API token and HTTP client")
+    parsed_ids = parse_service_ids(service_ids)
+    if not parsed_ids:
+        raise RuntimeError("PagerDuty mode requires at least one service ID mapping")
+    return PagerDutyOnCallClient(token=token, service_ids=parsed_ids, http=http)

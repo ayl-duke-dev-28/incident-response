@@ -32,6 +32,7 @@ from .executor import (
 from .history import PostmortemHistory, format_for_prompt, to_prior_incident
 from .integrations.github import GitHubClient
 from .integrations.metrics import MetricsClient
+from .integrations.on_call import DisabledOnCallClient, OnCallClient
 from .integrations.slack import SlackClient
 from .logging_config import set_incident_id
 from .pr_annotation import compose_pr_annotation
@@ -86,6 +87,7 @@ class IncidentOrchestrator:
         config: OrchestratorConfig,
         dedup: DedupIndex | RedisDedupIndex | None = None,
         executor: RemediationExecutor | None = None,
+        on_call: OnCallClient | None = None,
     ) -> None:
         self._llm = llm
         self._github = github
@@ -95,6 +97,7 @@ class IncidentOrchestrator:
         self._config = config
         self._dedup = dedup or DedupIndex()
         self._executor = executor or MockExecutor()
+        self._on_call = on_call or DisabledOnCallClient()
         self._runbooks: list[Runbook] = load_runbooks(config.runbooks_dir)
         self._history = PostmortemHistory.load(config.postmortem_dir)
 
@@ -240,6 +243,7 @@ class IncidentOrchestrator:
     async def handle_alert(self, alert: Alert) -> Incident:
         now = datetime.now(timezone.utc)
         fingerprint = alert_fingerprint(alert, self._config.dedup_bucket_minutes)
+        on_call = await self._on_call.lookup(alert.service)
 
         incident_id = f"inc-{alert.id}"
         set_incident_id(incident_id)
@@ -248,6 +252,7 @@ class IncidentOrchestrator:
             alert=alert,
             status=IncidentStatus.INVESTIGATING,
             created_at=now,
+            on_call=on_call,
             timeline=[{"timestamp": now.isoformat(), "event": f"Alert fired: {alert.title}"}],
         )
         correlation = self._store.correlate_alert(

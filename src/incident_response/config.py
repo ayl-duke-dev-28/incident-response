@@ -51,6 +51,20 @@ class Settings(BaseSettings):
     oidc_admin_groups: str = "incident-admins"
     operator_bearer_tokens: str = ""
 
+    # Operator ownership and ticket integrations
+    pagerduty_mode: Literal["mock", "disabled", "pagerduty"] = "mock"
+    pagerduty_api_token: str = ""
+    pagerduty_service_ids: str = ""
+    jira_mode: Literal["mock", "disabled", "jira"] = "mock"
+    jira_base_url: str = ""
+    jira_email: str = ""
+    jira_api_token: str = ""
+    jira_project_key: str = ""
+    jira_issue_type: str = "Incident"
+    linear_mode: Literal["mock", "disabled", "linear"] = "mock"
+    linear_api_token: str = ""
+    linear_team_id: str = ""
+
     # Durable alert queue retry schedule
     queue_retry_base_seconds: float = 1.0
     queue_retry_max_seconds: float = 60.0
@@ -106,6 +120,23 @@ class Settings(BaseSettings):
             raise ValueError("Production requires OIDC client credentials")
         if not self.oidc_metadata_url.startswith("https://"):
             raise ValueError("Production OIDC metadata URL must use HTTPS")
+        integration_modes = (self.pagerduty_mode, self.jira_mode, self.linear_mode)
+        if "mock" in integration_modes:
+            raise ValueError("Production integrations must be explicitly disabled or real")
+        if self.pagerduty_mode == "pagerduty" and (
+            not self.pagerduty_api_token or not self.pagerduty_service_ids
+        ):
+            raise ValueError("PagerDuty mode requires API token and service ID mappings")
+        if self.jira_mode == "jira" and not all(
+            (self.jira_base_url, self.jira_email, self.jira_api_token, self.jira_project_key)
+        ):
+            raise ValueError("Jira mode requires base URL, email, API token, and project key")
+        if self.jira_mode == "jira" and not self.jira_base_url.startswith("https://"):
+            raise ValueError("Jira base URL must use HTTPS")
+        if self.linear_mode == "linear" and not all(
+            (self.linear_api_token, self.linear_team_id)
+        ):
+            raise ValueError("Linear mode requires API token and team ID")
         return self
 
 
