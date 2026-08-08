@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import time
 from datetime import datetime, timedelta
 from typing import Any, Callable, ContextManager, Protocol
@@ -11,8 +12,10 @@ from uuid import uuid4
 from .models import (
     Alert,
     CorrelationResult,
+    ExternalReference,
     Incident,
     IncidentStatus,
+    OutboxMessage,
     RemediationStatus,
 )
 from .queue import (
@@ -130,6 +133,25 @@ CREATE TABLE IF NOT EXISTS incident_correlations (
 );
 """
 
+_OUTBOX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS outbox (
+    id TEXT PRIMARY KEY,
+    aggregate_id TEXT NOT NULL REFERENCES incidents(id),
+    destination TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_error TEXT,
+    lease_token TEXT,
+    lease_expires_at DOUBLE PRECISION,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    delivered_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS outbox_due_idx
+ON outbox(status, next_attempt_at, created_at, id);
+"""
+
 
 def apply_postgres_migrations(connection: PostgresConnection) -> None:
     """Apply idempotent schema versions within the caller's transaction."""
@@ -162,6 +184,16 @@ def apply_postgres_migrations(connection: PostgresConnection) -> None:
             "INSERT INTO schema_migrations (version) VALUES (%s)",
             (2,),
         )
+    row = connection.execute(
+        "SELECT version FROM schema_migrations WHERE version = %s",
+        (3,),
+    ).fetchone()
+    if row is None:
+        connection.execute(_OUTBOX_SCHEMA)
+        connection.execute(
+            "INSERT INTO schema_migrations (version) VALUES (%s)",
+            (3,),
+        )
 
 
 def _model_payload(value: object) -> dict[str, Any]:
@@ -177,8 +209,14 @@ def _model_payload(value: object) -> dict[str, Any]:
 
 
 class PostgresIncidentStore:
-    def __init__(self, database: PostgresDatabaseLike) -> None:
+    def __init__(
+        self,
+        database: PostgresDatabaseLike,
+        *,
+        outbox_destinations: tuple[str, ...] = (),
+    ) -> None:
         self._database = database
+        self._outbox_destinations = outbox_destinations
 
     @staticmethod
     def _save_with_conn(connection: PostgresConnection, incident: Incident) -> None:
@@ -222,6 +260,112 @@ class PostgresIncidentStore:
     def get(self, incident_id: str) -> Incident | None:
         with self._database.connection() as connection:
             return self._get_with_conn(connection, incident_id)
+
+    def _enqueue_outbox(
+        self,
+        connection: PostgresConnection,
+        incident: Incident,
+    ) -> None:
+        for destination in self._outbox_destinations:
+            idempotency_key = f"incident:{incident.id}:ticket:{destination}"
+            message_id = hashlib.sha256(idempotency_key.encode()).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO outbox (id, aggregate_id, destination, idempotency_key)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT(idempotency_key) DO NOTHING
+                """,
+                (message_id, incident.id, destination, idempotency_key),
+            )
+
+    @staticmethod
+    def _outbox_from_row(row: object) -> OutboxMessage:
+        return OutboxMessage(
+            id=row["id"],
+            aggregate_id=row["aggregate_id"],
+            destination=row["destination"],
+            idempotency_key=row["idempotency_key"],
+            status=row["status"],
+            attempt_count=row["attempt_count"],
+            next_attempt_at=row["next_attempt_at"],
+            lease_token=row["lease_token"],
+            lease_expires_at=row["lease_expires_at"],
+        )
+
+    def claim_outbox(self, *, now: float, lease_seconds: float) -> OutboxMessage | None:
+        with self._database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT id, aggregate_id, destination, idempotency_key, status,
+                       attempt_count, next_attempt_at, lease_token, lease_expires_at
+                FROM outbox
+                WHERE status = 'pending'
+                  AND next_attempt_at <= %s
+                  AND (lease_token IS NULL OR lease_expires_at <= %s)
+                ORDER BY created_at, id
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+                """,
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            lease_token = uuid4().hex
+            lease_expires_at = now + lease_seconds
+            connection.execute(
+                "UPDATE outbox SET lease_token = %s, lease_expires_at = %s WHERE id = %s",
+                (lease_token, lease_expires_at, row["id"]),
+            )
+            values = dict(row)
+            values.update(
+                lease_token=lease_token,
+                lease_expires_at=lease_expires_at,
+            )
+            return self._outbox_from_row(values)
+
+    def complete_outbox(
+        self,
+        message: OutboxMessage,
+        reference: ExternalReference,
+    ) -> bool:
+        if not message.lease_token:
+            return False
+        with self._database.connection() as connection:
+            row = connection.execute(
+                """
+                SELECT status, lease_token FROM outbox
+                WHERE id = %s FOR UPDATE
+                """,
+                (message.id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "pending"
+                or row["lease_token"] != message.lease_token
+            ):
+                return False
+            incident = self._get_with_conn(connection, message.aggregate_id, for_update=True)
+            if incident is None:
+                raise RuntimeError("Outbox message references a missing incident")
+            references = incident.external_references
+            if not any(
+                item.provider == reference.provider
+                and item.external_id == reference.external_id
+                for item in references
+            ):
+                incident = incident.model_copy(
+                    update={"external_references": references + [reference]}
+                )
+                self._save_with_conn(connection, incident)
+            result = connection.execute(
+                """
+                UPDATE outbox SET status = 'delivered', delivered_at = now(),
+                    lease_token = NULL, lease_expires_at = NULL
+                WHERE id = %s AND status = 'pending' AND lease_token = %s
+                """,
+                (message.id, message.lease_token),
+            )
+            return result.rowcount == 1
 
     def correlate_alert(
         self,
@@ -301,6 +445,8 @@ class PostgresIncidentStore:
                 created = True
 
             self._save_with_conn(connection, incident)
+            if created:
+                self._enqueue_outbox(connection, incident)
             connection.execute(
                 """
                 INSERT INTO incident_correlations
