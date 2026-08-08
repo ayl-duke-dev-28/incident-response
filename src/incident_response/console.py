@@ -9,12 +9,14 @@ import logging
 from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, quote, urlsplit
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from .config import Settings
+from .auth import AuthContext
 from .demo import build_unique_console_demo_alert
 from .models import Incident, IncidentStatus, RemediationStatus, Runbook
 from .orchestrator import IncidentOrchestrator
@@ -130,17 +132,27 @@ def _mock_console_writes_enabled(settings: Settings) -> bool:
     )
 
 
-def _render_demo_button(settings: Settings) -> str:
+def _csrf_input(csrf_token: str) -> str:
+    if not csrf_token:
+        return ""
+    return (
+        '<input type="hidden" name="csrf_token" '
+        f'value="{escape(csrf_token, quote=True)}">'
+    )
+
+
+def _render_demo_button(settings: Settings, csrf_token: str = "") -> str:
     if not _mock_console_writes_enabled(settings):
         return ""
     return (
         '<form method="post" action="/console/demo-alert">'
+        f"{_csrf_input(csrf_token)}"
         '<button type="submit" class="primary">Trigger demo incident</button>'
         "</form>"
     )
 
 
-def _render_empty_state(settings: Settings) -> str:
+def _render_empty_state(settings: Settings, csrf_token: str = "") -> str:
     if not _mock_console_writes_enabled(settings):
         return (
             '<section class="empty">'
@@ -152,7 +164,7 @@ def _render_empty_state(settings: Settings) -> str:
         '<section class="empty">'
         "<h2>No active incidents</h2>"
         f"<p>{escape(_EMPTY_BODY)}</p>"
-        f"{_render_demo_button(settings)}"
+        f"{_render_demo_button(settings, csrf_token)}"
         "</section>"
     )
 
@@ -190,6 +202,7 @@ def _render_console(
     settings: Settings,
     queue_depth: int,
     now: datetime,
+    csrf_token: str = "",
 ) -> str:
     open_incidents = [i for i in incidents if i.status in _OPEN_STATUSES]
     resolved = [i for i in incidents if i.status == IncidentStatus.RESOLVED]
@@ -199,13 +212,14 @@ def _render_console(
         "<h1>Autonomous Incident Response</h1>"
         f"{_render_environment(settings)}"
         f'<div class="queue">Queue depth <strong>{queue_depth}</strong></div>'
-        f"{_render_demo_button(settings)}"
+        f"{_render_demo_button(settings, csrf_token)}"
         "</header>"
     )
 
     if not incidents:
         return _page(
-            "Incident console", header + f"<main>{_render_empty_state(settings)}</main>"
+            "Incident console",
+            header + f"<main>{_render_empty_state(settings, csrf_token)}</main>",
         )
 
     sections = []
@@ -372,7 +386,11 @@ def _render_resolution(incident: Incident) -> str:
     )
 
 
-def _render_remediation_approval(incident: Incident, settings: Settings) -> str:
+def _render_remediation_approval(
+    incident: Incident,
+    settings: Settings,
+    csrf_token: str = "",
+) -> str:
     remediation = incident.remediation
     if remediation is None:
         return ""
@@ -392,12 +410,14 @@ def _render_remediation_approval(incident: Incident, settings: Settings) -> str:
             decision = (
                 '<div class="approval-actions">'
                 f'<form method="post" action="{base}/approve">'
+                f"{_csrf_input(csrf_token)}"
                 '<label for="approval-note">Decision note</label>'
                 '<textarea id="approval-note" name="note" maxlength="500" rows="2" '
                 'placeholder="Why is this safe to run?"></textarea>'
                 '<button type="submit" class="primary">Approve and run</button>'
                 "</form>"
                 f'<form method="post" action="{base}/reject">'
+                f"{_csrf_input(csrf_token)}"
                 '<label for="rejection-note">Rejection reason</label>'
                 '<textarea id="rejection-note" name="note" maxlength="500" rows="2" '
                 'placeholder="Why should this not run?"></textarea>'
@@ -440,7 +460,11 @@ def _render_remediation_approval(incident: Incident, settings: Settings) -> str:
     )
 
 
-def _render_resolve_action(incident: Incident, settings: Settings) -> str:
+def _render_resolve_action(
+    incident: Incident,
+    settings: Settings,
+    csrf_token: str = "",
+) -> str:
     if (
         not _mock_console_writes_enabled(settings)
         or incident.status == IncidentStatus.RESOLVED
@@ -451,6 +475,7 @@ def _render_resolve_action(incident: Incident, settings: Settings) -> str:
         '<section class="detail-section resolve-action"><h2>Resolve incident</h2>'
         '<p>Record the mitigation and generate a post-mortem.</p>'
         f'<form method="post" action="/console/incidents/{escape(incident.id)}/resolve">'
+        f"{_csrf_input(csrf_token)}"
         '<label for="resolution-note">Resolution note</label>'
         f'<textarea id="resolution-note" name="resolution_note" maxlength="{_MAX_RESOLUTION_NOTE_CHARS}" '
         'rows="3" placeholder="What fixed the incident?"></textarea>'
@@ -459,7 +484,11 @@ def _render_resolve_action(incident: Incident, settings: Settings) -> str:
     )
 
 
-def _render_incident_detail(incident: Incident, settings: Settings) -> str:
+def _render_incident_detail(
+    incident: Incident,
+    settings: Settings,
+    csrf_token: str = "",
+) -> str:
     triage_in_progress = incident.triage is None
     refresh_status = ""
     if triage_in_progress:
@@ -475,9 +504,9 @@ def _render_incident_detail(incident: Incident, settings: Settings) -> str:
         + refresh_status
         + _render_alert_detail(incident)
         + _render_triage_detail(incident)
-        + _render_remediation_approval(incident, settings)
+        + _render_remediation_approval(incident, settings, csrf_token)
         + _render_timeline(incident)
-        + _render_resolve_action(incident, settings)
+        + _render_resolve_action(incident, settings, csrf_token)
         + _render_resolution(incident)
         + "</main>"
     )
@@ -664,28 +693,57 @@ def register_console(
     orchestrator: IncidentOrchestrator,
     queue: AlertQueue,
     settings: Settings,
+    auth: AuthContext | None = None,
+    viewer_dependency: Callable[..., object] | None = None,
+    responder_write_dependency: Callable[..., object] | None = None,
+    admin_write_dependency: Callable[..., object] | None = None,
 ) -> None:
     """Mount console routes onto an existing app. Call after API routes."""
 
-    @app.get("/console", response_class=HTMLResponse)
-    async def console() -> HTMLResponse:
+    viewer_dependencies = [Depends(viewer_dependency)] if viewer_dependency else []
+    responder_dependencies = (
+        [Depends(responder_write_dependency)] if responder_write_dependency else []
+    )
+    admin_dependencies = [Depends(admin_write_dependency)] if admin_write_dependency else []
+
+    @app.get(
+        "/console",
+        response_class=HTMLResponse,
+        dependencies=viewer_dependencies,
+    )
+    async def console(request: Request) -> HTMLResponse:
         incidents = orchestrator.store.list_recent(limit=CONSOLE_LIMIT)
         html = _render_console(
             incidents,
             settings=settings,
             queue_depth=queue.qsize(),
             now=datetime.now(timezone.utc),
+            csrf_token=auth.csrf_token(request) if auth else "",
         )
         return HTMLResponse(content=html)
 
-    @app.get("/console/incidents/{incident_id}", response_class=HTMLResponse)
-    async def console_incident(incident_id: str) -> HTMLResponse:
+    @app.get(
+        "/console/incidents/{incident_id}",
+        response_class=HTMLResponse,
+        dependencies=viewer_dependencies,
+    )
+    async def console_incident(incident_id: str, request: Request) -> HTMLResponse:
         incident = orchestrator.store.get(incident_id)
         if incident is None:
             return HTMLResponse(content=_render_not_found(incident_id), status_code=404)
-        return HTMLResponse(content=_render_incident_detail(incident, settings))
+        return HTMLResponse(
+            content=_render_incident_detail(
+                incident,
+                settings,
+                auth.csrf_token(request) if auth else "",
+            )
+        )
 
-    @app.get("/console/runbooks/{slug:path}", response_class=HTMLResponse)
+    @app.get(
+        "/console/runbooks/{slug:path}",
+        response_class=HTMLResponse,
+        dependencies=viewer_dependencies,
+    )
     async def console_runbook(slug: str) -> HTMLResponse:
         runbook = orchestrator.get_runbook(slug)
         if runbook is None:
@@ -695,7 +753,7 @@ def register_console(
             )
         return HTMLResponse(content=_render_runbook_preview(runbook))
 
-    @app.post("/console/demo-alert")
+    @app.post("/console/demo-alert", dependencies=admin_dependencies)
     async def console_demo_alert(request: Request) -> HTMLResponse:
         if not _mock_console_writes_enabled(settings):
             return HTMLResponse(
@@ -742,7 +800,10 @@ def register_console(
             )
         return RedirectResponse(url=f"/console/incidents/{incident_id}", status_code=303)
 
-    @app.post("/console/incidents/{incident_id}/resolve")
+    @app.post(
+        "/console/incidents/{incident_id}/resolve",
+        dependencies=responder_dependencies,
+    )
     async def console_resolve_incident(
         incident_id: str, request: Request
     ) -> Response:
@@ -866,7 +927,10 @@ def register_console(
             )
         return RedirectResponse(url=f"/console/incidents/{incident_id}", status_code=303)
 
-    @app.post("/console/incidents/{incident_id}/remediation/approve")
+    @app.post(
+        "/console/incidents/{incident_id}/remediation/approve",
+        dependencies=admin_dependencies,
+    )
     async def console_approve_remediation(
         incident_id: str,
         request: Request,
@@ -877,7 +941,10 @@ def register_console(
             approve=True,
         )
 
-    @app.post("/console/incidents/{incident_id}/remediation/reject")
+    @app.post(
+        "/console/incidents/{incident_id}/remediation/reject",
+        dependencies=responder_dependencies,
+    )
     async def console_reject_remediation(
         incident_id: str,
         request: Request,

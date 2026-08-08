@@ -13,6 +13,7 @@ Endpoints:
 from __future__ import annotations
 
 import logging
+import secrets
 from inspect import isawaitable
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -21,8 +22,18 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import RedirectResponse
 
 from .agents.llm import AnthropicLLM, DemoLLM, LLM
+from .auth import (
+    AuthContext,
+    AuthPolicy,
+    Principal,
+    Role,
+    build_oidc_client,
+    csv_groups,
+)
 from .config import Settings, load_settings
 from .console import STATIC_DIR, register_console
 from .db import IncidentStore
@@ -145,10 +156,23 @@ def create_app(
     *,
     redis_client: Any | None = None,
     postgres_database: Any | None = None,
+    oidc_client: Any | None = None,
+    auth_policy: AuthPolicy | None = None,
 ) -> FastAPI:
     settings = settings or load_settings()
     configure_logging(settings.log_level)
     setup_tracing(settings.otel_service_name)
+
+    auth_policy = auth_policy or AuthPolicy(
+        viewer_groups=csv_groups(settings.oidc_viewer_groups),
+        responder_groups=csv_groups(settings.oidc_responder_groups),
+        admin_groups=csv_groups(settings.oidc_admin_groups),
+        groups_claim=settings.oidc_groups_claim,
+        session_seconds=settings.session_seconds,
+    )
+    auth = AuthContext(enabled=settings.auth_mode == "oidc", policy=auth_policy)
+    if auth.enabled and oidc_client is None:
+        oidc_client = build_oidc_client(settings)
 
     owns_redis = False
     if settings.redis_url:
@@ -223,6 +247,15 @@ def create_app(
             logger.info("app_stopped")
 
     app = FastAPI(title="Autonomous Incident Response", version="0.2.0", lifespan=lifespan)
+    if auth.enabled:
+        app.add_middleware(
+            SessionMiddleware,
+            secret_key=settings.session_secret or secrets.token_urlsafe(32),
+            session_cookie="incident_response_session",
+            max_age=settings.session_seconds,
+            same_site="lax",
+            https_only=settings.session_https_only,
+        )
     instrument_app(app)
 
     app.state.orchestrator = orchestrator
@@ -230,6 +263,7 @@ def create_app(
     app.state.limiter = limiter
     app.state.redis = redis_client
     app.state.postgres_database = postgres_database
+    app.state.auth = auth
     app.state.settings = settings
 
     @app.middleware("http")
@@ -262,6 +296,108 @@ def create_app(
             raise HTTPException(status_code=401, detail="Invalid webhook credentials")
         return body
 
+    async def _require_operator(
+        request: Request,
+        role: Role,
+        *,
+        csrf: bool = False,
+        legacy_webhook: bool = False,
+        redirect_to_login: bool = False,
+    ) -> Principal:
+        if auth.enabled:
+            return await auth.require(
+                request,
+                role,
+                csrf=csrf,
+                redirect_to_login=redirect_to_login,
+            )
+        if legacy_webhook:
+            await _verify_inbound(request)
+        principal = auth.principal(request)
+        assert principal is not None
+        return principal
+
+    async def _viewer(request: Request) -> Principal:
+        return await _require_operator(request, Role.VIEWER)
+
+    async def _legacy_viewer(request: Request) -> Principal:
+        return await _require_operator(request, Role.VIEWER, legacy_webhook=True)
+
+    async def _responder_write(request: Request) -> Principal:
+        return await _require_operator(
+            request,
+            Role.RESPONDER,
+            csrf=True,
+            legacy_webhook=True,
+        )
+
+    async def _viewer_write(request: Request) -> Principal:
+        return await _require_operator(
+            request,
+            Role.VIEWER,
+            csrf=True,
+        )
+
+    async def _admin_write(request: Request) -> Principal:
+        return await _require_operator(
+            request,
+            Role.ADMIN,
+            csrf=True,
+            legacy_webhook=True,
+        )
+
+    async def _console_viewer(request: Request) -> Principal:
+        return await _require_operator(
+            request,
+            Role.VIEWER,
+            redirect_to_login=True,
+        )
+
+    async def _console_responder_write(request: Request) -> Principal:
+        return await _require_operator(
+            request,
+            Role.RESPONDER,
+            csrf=True,
+            redirect_to_login=True,
+        )
+
+    async def _console_admin_write(request: Request) -> Principal:
+        return await _require_operator(
+            request,
+            Role.ADMIN,
+            csrf=True,
+            redirect_to_login=True,
+        )
+
+    if auth.enabled:
+
+        @app.get("/auth/login")
+        async def login(request: Request):
+            redirect_uri = request.url_for("auth_callback")
+            return await oidc_client.authorize_redirect(request, redirect_uri)
+
+        @app.get("/auth/callback", name="auth_callback")
+        async def auth_callback(request: Request):
+            token = await oidc_client.authorize_access_token(request)
+            try:
+                session = auth_policy.session_from_oidc_token(token)
+            except PermissionError as exc:
+                raise HTTPException(
+                    status_code=403,
+                    detail="OIDC user is not authorized",
+                ) from exc
+            request.session.clear()
+            request.session.update(session)
+            return RedirectResponse("/console", status_code=303)
+
+        @app.post("/auth/logout")
+        async def logout(
+            request: Request,
+            _principal: Principal = Depends(_viewer_write),
+        ):
+            request.session.clear()
+            return RedirectResponse("/console", status_code=303)
+
     async def _rate_limit(request: Request, service: str) -> None:
         client_ip = request.client.host if request.client else "unknown"
         key = f"{client_ip}|{service}"
@@ -286,7 +422,7 @@ def create_app(
     async def list_dead_letters(
         request: Request,
         limit: int = Query(default=50, ge=1, le=200),
-        _body: bytes = Depends(_verify_inbound),
+        _principal: Principal = Depends(_legacy_viewer),
     ) -> list[DeadLetter]:
         return queue.list_dead_letters(limit=limit)
 
@@ -294,7 +430,7 @@ def create_app(
     async def replay_dead_letter(
         alert_id: str,
         request: Request,
-        _body: bytes = Depends(_verify_inbound),
+        _principal: Principal = Depends(_admin_write),
     ) -> dict[str, str]:
         try:
             alert = await queue.replay_dead_letter(
@@ -329,7 +465,7 @@ def create_app(
         incident_id: str,
         payload: ResolvePayload,
         request: Request,
-        _body: bytes = Depends(_verify_inbound),
+        _principal: Principal = Depends(_responder_write),
     ) -> Incident:
         set_incident_id(incident_id)
         try:
@@ -342,13 +478,17 @@ def create_app(
         incident_id: str,
         payload: RemediationDecisionPayload,
         request: Request,
-        _body: bytes = Depends(_verify_inbound),
+        principal: Principal = Depends(_admin_write),
     ) -> Incident:
         set_incident_id(incident_id)
         try:
             return await orchestrator.approve_remediation(
                 incident_id,
-                decided_by=payload.decided_by,
+                decided_by=(
+                    principal.email or principal.subject
+                    if auth.enabled
+                    else payload.decided_by
+                ),
                 note=payload.note,
             )
         except LookupError as exc:
@@ -361,13 +501,17 @@ def create_app(
         incident_id: str,
         payload: RemediationDecisionPayload,
         request: Request,
-        _body: bytes = Depends(_verify_inbound),
+        principal: Principal = Depends(_responder_write),
     ) -> Incident:
         set_incident_id(incident_id)
         try:
             return await orchestrator.reject_remediation(
                 incident_id,
-                decided_by=payload.decided_by,
+                decided_by=(
+                    principal.email or principal.subject
+                    if auth.enabled
+                    else payload.decided_by
+                ),
                 note=payload.note,
             )
         except LookupError as exc:
@@ -377,13 +521,17 @@ def create_app(
 
     @app.get("/incidents")
     async def list_incidents(
+        _principal: Principal = Depends(_viewer),
         incident_status: IncidentStatus | None = Query(default=None, alias="status"),
         limit: int = Query(default=50, ge=1, le=200),
     ) -> list[Incident]:
         return orchestrator.store.list_recent(limit=limit, status=incident_status)
 
     @app.get("/incidents/{incident_id}")
-    async def get_incident(incident_id: str) -> Incident:
+    async def get_incident(
+        incident_id: str,
+        _principal: Principal = Depends(_viewer),
+    ) -> Incident:
         set_incident_id(incident_id)
         incident = orchestrator.store.get(incident_id)
         if incident is None:
@@ -391,7 +539,16 @@ def create_app(
         return incident
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-    register_console(app, orchestrator=orchestrator, queue=queue, settings=settings)
+    register_console(
+        app,
+        orchestrator=orchestrator,
+        queue=queue,
+        settings=settings,
+        auth=auth,
+        viewer_dependency=_console_viewer,
+        responder_write_dependency=_console_responder_write,
+        admin_write_dependency=_console_admin_write,
+    )
 
     return app
 

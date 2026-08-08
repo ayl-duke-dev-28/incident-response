@@ -9,6 +9,8 @@ from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass
 from enum import Enum
 
+from fastapi import HTTPException, Request
+
 
 class Role(str, Enum):
     VIEWER = "viewer"
@@ -127,3 +129,81 @@ class AuthPolicy:
             return False
         expected = session.get("csrf_token")
         return isinstance(expected, str) and hmac.compare_digest(expected, supplied)
+
+
+class AuthContext:
+    """Resolve signed sessions and enforce route roles without trusting form identity."""
+
+    def __init__(self, *, enabled: bool, policy: AuthPolicy) -> None:
+        self.enabled = enabled
+        self.policy = policy
+        self._development_principal = Principal(
+            subject="local-development",
+            email="local-development",
+            name="Local development",
+            role=Role.ADMIN,
+        )
+
+    def principal(self, request: Request) -> Principal | None:
+        if not self.enabled:
+            return self._development_principal
+        return self.policy.principal_from_session(request.session)
+
+    async def require(
+        self,
+        request: Request,
+        role: Role,
+        *,
+        csrf: bool = False,
+        redirect_to_login: bool = False,
+    ) -> Principal:
+        principal = self.principal(request)
+        if principal is None:
+            if redirect_to_login:
+                raise HTTPException(
+                    status_code=303,
+                    detail="Authentication required",
+                    headers={"Location": "/auth/login"},
+                )
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if not principal.permits(role):
+            raise HTTPException(status_code=403, detail="Insufficient role")
+        if csrf and self.enabled:
+            supplied = request.headers.get("x-csrf-token", "")
+            if not supplied:
+                content_type = request.headers.get("content-type", "")
+                if content_type.startswith("application/x-www-form-urlencoded"):
+                    form = await request.form()
+                    supplied = str(form.get("csrf_token", ""))
+            if not self.policy.verify_csrf(request.session, supplied):
+                raise HTTPException(status_code=403, detail="Invalid CSRF token")
+        return principal
+
+    def csrf_token(self, request: Request) -> str:
+        if not self.enabled:
+            return ""
+        value = request.session.get("csrf_token")
+        return value if isinstance(value, str) else ""
+
+
+def csv_groups(value: str) -> set[str]:
+    return {group.strip() for group in value.split(",") if group.strip()}
+
+
+def build_oidc_client(settings: object) -> object:
+    try:
+        from authlib.integrations.starlette_client import OAuth
+    except ImportError as exc:
+        raise RuntimeError(
+            "OIDC requires the production dependencies; "
+            "install incident-response[production]"
+        ) from exc
+    oauth = OAuth()
+    oauth.register(
+        name="incident_response",
+        client_id=settings.oidc_client_id,
+        client_secret=settings.oidc_client_secret,
+        server_metadata_url=settings.oidc_metadata_url,
+        client_kwargs={"scope": "openid profile email"},
+    )
+    return oauth.create_client("incident_response")
