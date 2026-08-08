@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     queue_retry_base_seconds: float = 1.0
     queue_retry_max_seconds: float = 60.0
     queue_max_attempts: int = 5
+    queue_lease_seconds: float = 300.0
 
     # HMAC signing secrets — optional per source
     datadog_webhook_secret: str = ""

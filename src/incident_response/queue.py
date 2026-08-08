@@ -13,9 +13,11 @@ import logging
 import sqlite3
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Iterator
+from uuid import uuid4
 
 from pydantic import BaseModel
 
@@ -41,6 +43,12 @@ class DeadLetter(BaseModel):
     last_error: str
     failed_at: datetime
 
+
+@dataclass(frozen=True)
+class _ClaimedAlert:
+    alert: Alert
+    lease_token: str
+
 _QUEUE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS alert_queue (
     alert_id TEXT PRIMARY KEY,
@@ -48,7 +56,9 @@ CREATE TABLE IF NOT EXISTS alert_queue (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     attempt_count INTEGER NOT NULL DEFAULT 0,
     next_attempt_at REAL NOT NULL DEFAULT 0,
-    last_error TEXT
+    last_error TEXT,
+    lease_token TEXT,
+    lease_expires_at REAL
 );
 CREATE INDEX IF NOT EXISTS alert_queue_created_idx
 ON alert_queue(created_at, alert_id);
@@ -95,6 +105,10 @@ class _DurableAlertStore:
                 "ADD COLUMN next_attempt_at REAL NOT NULL DEFAULT 0"
             ),
             "last_error": "ALTER TABLE alert_queue ADD COLUMN last_error TEXT",
+            "lease_token": "ALTER TABLE alert_queue ADD COLUMN lease_token TEXT",
+            "lease_expires_at": (
+                "ALTER TABLE alert_queue ADD COLUMN lease_expires_at REAL"
+            ),
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -121,40 +135,84 @@ class _DurableAlertStore:
             )
             return cursor.rowcount == 1
 
-    def get(self, alert_id: str) -> Alert | None:
+    def claim(
+        self,
+        alert_id: str,
+        *,
+        now: float,
+        lease_seconds: float,
+    ) -> _ClaimedAlert | None:
         with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT payload FROM alert_queue WHERE alert_id = ?",
-                (alert_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return Alert.model_validate(json.loads(row["payload"]))
-
-    def delete(self, alert_id: str) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "DELETE FROM alert_queue WHERE alert_id = ?",
-                (alert_id,),
-            )
-
-    def pending_ids(self, now: float) -> list[str]:
-        with self._conn() as conn:
-            rows = conn.execute(
                 """
-                SELECT alert_id
+                SELECT payload
+                FROM alert_queue
+                WHERE alert_id = ?
+                  AND next_attempt_at <= ?
+                  AND (lease_token IS NULL OR lease_expires_at <= ?)
+                """,
+                (alert_id, now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            lease_token = uuid4().hex
+            conn.execute(
+                """
+                UPDATE alert_queue
+                SET lease_token = ?, lease_expires_at = ?
+                WHERE alert_id = ?
+                """,
+                (lease_token, now + lease_seconds, alert_id),
+            )
+        return _ClaimedAlert(
+            alert=Alert.model_validate(json.loads(row["payload"])),
+            lease_token=lease_token,
+        )
+
+    def claim_next(self, *, now: float, lease_seconds: float) -> _ClaimedAlert | None:
+        with self._conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT alert_id, payload
                 FROM alert_queue
                 WHERE next_attempt_at <= ?
+                  AND (lease_token IS NULL OR lease_expires_at <= ?)
                 ORDER BY created_at ASC, alert_id ASC
+                LIMIT 1
                 """,
-                (now,),
-            ).fetchall()
-        return [str(row["alert_id"]) for row in rows]
+                (now, now),
+            ).fetchone()
+            if row is None:
+                return None
+            lease_token = uuid4().hex
+            conn.execute(
+                """
+                UPDATE alert_queue
+                SET lease_token = ?, lease_expires_at = ?
+                WHERE alert_id = ?
+                """,
+                (lease_token, now + lease_seconds, row["alert_id"]),
+            )
+        return _ClaimedAlert(
+            alert=Alert.model_validate(json.loads(row["payload"])),
+            lease_token=lease_token,
+        )
+
+    def delete(self, alert_id: str, *, lease_token: str) -> bool:
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM alert_queue WHERE alert_id = ? AND lease_token = ?",
+                (alert_id, lease_token),
+            )
+            return cursor.rowcount == 1
 
     def record_failure(
         self,
         alert_id: str,
         *,
+        lease_token: str,
         error: str,
         base_seconds: float,
         max_seconds: float,
@@ -163,8 +221,12 @@ class _DurableAlertStore:
         with self._conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT payload, attempt_count FROM alert_queue WHERE alert_id = ?",
-                (alert_id,),
+                """
+                SELECT payload, attempt_count
+                FROM alert_queue
+                WHERE alert_id = ? AND lease_token = ?
+                """,
+                (alert_id, lease_token),
             ).fetchone()
             if row is None:
                 return False
@@ -180,8 +242,11 @@ class _DurableAlertStore:
                     (alert_id, row["payload"], attempt_count, truncated_error),
                 )
                 conn.execute(
-                    "DELETE FROM alert_queue WHERE alert_id = ?",
-                    (alert_id,),
+                    """
+                    DELETE FROM alert_queue
+                    WHERE alert_id = ? AND lease_token = ?
+                    """,
+                    (alert_id, lease_token),
                 )
                 return True
             delay = _retry_delay(
@@ -194,14 +259,17 @@ class _DurableAlertStore:
                 UPDATE alert_queue
                 SET attempt_count = ?,
                     next_attempt_at = ?,
-                    last_error = ?
-                WHERE alert_id = ?
+                    last_error = ?,
+                    lease_token = NULL,
+                    lease_expires_at = NULL
+                WHERE alert_id = ? AND lease_token = ?
                 """,
                 (
                     attempt_count,
                     time.time() + delay,
                     truncated_error,
                     alert_id,
+                    lease_token,
                 ),
             )
             return False
@@ -271,6 +339,7 @@ class AlertQueue:
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 60.0,
         max_attempts: int = 5,
+        lease_seconds: float = 300.0,
     ) -> None:
         if retry_base_seconds < 0:
             raise ValueError("retry_base_seconds must be non-negative")
@@ -278,12 +347,15 @@ class AlertQueue:
             raise ValueError("retry_max_seconds must be at least retry_base_seconds")
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         self._handler = handler
         self._queue: asyncio.Queue[Alert | str] = asyncio.Queue(maxsize=maxsize)
         self._store = _DurableAlertStore(db_path) if db_path is not None else None
         self._retry_base_seconds = retry_base_seconds
         self._retry_max_seconds = retry_max_seconds
         self._max_attempts = max_attempts
+        self._lease_seconds = lease_seconds
         self._worker: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
 
@@ -315,33 +387,48 @@ class AlertQueue:
     async def _run(self) -> None:
         while not self._stopping.is_set():
             queued_item = False
+            claimed: _ClaimedAlert | None = None
             try:
                 item = await asyncio.wait_for(self._queue.get(), timeout=0.1)
                 queued_item = True
             except asyncio.TimeoutError:
-                item = self._next_recovered_id()
-                if item is None:
+                if self._store is None:
+                    continue
+                claimed = self._store.claim_next(
+                    now=time.time(),
+                    lease_seconds=self._lease_seconds,
+                )
+                if claimed is None:
                     continue
 
             alert_id: str | None = None
+            lease_token: str | None = None
             if self._store is None:
                 assert isinstance(item, Alert)
                 alert = item
             else:
-                assert isinstance(item, str)
-                alert_id = item
-                alert = self._store.get(alert_id)
-                if alert is None:
+                if claimed is None:
+                    assert isinstance(item, str)
+                    claimed = self._store.claim(
+                        item,
+                        now=time.time(),
+                        lease_seconds=self._lease_seconds,
+                    )
+                if claimed is None:
                     if queued_item:
                         self._queue.task_done()
                     continue
+                alert = claimed.alert
+                alert_id = alert.id
+                lease_token = claimed.lease_token
             try:
                 await self._handler(alert)
             except Exception as exc:
                 logger.exception("worker_handler_failed", extra={"alert_id": alert.id})
-                if alert_id is not None:
+                if alert_id is not None and lease_token is not None:
                     dead_lettered = self._store.record_failure(
                         alert_id,
+                        lease_token=lease_token,
                         error=str(exc),
                         base_seconds=self._retry_base_seconds,
                         max_seconds=self._retry_max_seconds,
@@ -356,16 +443,11 @@ class AlertQueue:
                             },
                         )
             else:
-                if alert_id is not None:
-                    self._store.delete(alert_id)
+                if alert_id is not None and lease_token is not None:
+                    self._store.delete(alert_id, lease_token=lease_token)
             finally:
                 if queued_item:
                     self._queue.task_done()
-
-    def _next_recovered_id(self) -> str | None:
-        if self._store is None:
-            return None
-        return next(iter(self._store.pending_ids(time.time())), None)
 
     def qsize(self) -> int:
         if self._store is not None:

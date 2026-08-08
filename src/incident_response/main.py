@@ -143,6 +143,7 @@ def create_app(settings: Settings | None = None, llm: LLM | None = None) -> Fast
         retry_base_seconds=settings.queue_retry_base_seconds,
         retry_max_seconds=settings.queue_retry_max_seconds,
         max_attempts=settings.queue_max_attempts,
+        lease_seconds=settings.queue_lease_seconds,
     )
     limiter = SlidingWindowRateLimiter(
         max_events=settings.rate_limit_max,
