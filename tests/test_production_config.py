@@ -40,6 +40,11 @@ def test_production_profile_fails_closed_without_secure_shared_services(
         "environment": "production",
         "database_url": "postgresql+psycopg://app:secret@db/incidents",
         "redis_url": "rediss://redis:6379/0",
+        "auth_mode": "oidc",
+        "session_secret": "s" * 32,
+        "oidc_client_id": "incident-response",
+        "oidc_client_secret": "client-secret",
+        "oidc_metadata_url": "https://identity.example/.well-known/openid-configuration",
         **overrides,
     }
 

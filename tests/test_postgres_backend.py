@@ -210,6 +210,11 @@ def test_production_app_uses_postgres_stores_and_manages_database_lifecycle(
         environment="production",
         database_url="postgresql+psycopg://app:secret@db/incidents",
         redis_url="rediss://redis:6379/0",
+        auth_mode="oidc",
+        session_secret="s" * 32,
+        oidc_client_id="incident-response",
+        oidc_client_secret="client-secret",
+        oidc_metadata_url="https://identity.example/.well-known/openid-configuration",
         llm_mode="mock",
         runbooks_dir=runbooks_dir,
     )

@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     redis_require_tls: bool = True
     webhook_token: str = "change-me"
 
+    # Operator identity and browser sessions
+    auth_mode: Literal["disabled", "oidc"] = "disabled"
+    session_secret: str = ""
+    session_seconds: int = 8 * 60 * 60
+    session_https_only: bool = True
+    oidc_client_id: str = ""
+    oidc_client_secret: str = ""
+    oidc_metadata_url: str = ""
+    oidc_groups_claim: str = "groups"
+    oidc_viewer_groups: str = "incident-viewers"
+    oidc_responder_groups: str = "incident-responders"
+    oidc_admin_groups: str = "incident-admins"
+
     # Durable alert queue retry schedule
     queue_retry_base_seconds: float = 1.0
     queue_retry_max_seconds: float = 60.0
@@ -82,6 +95,16 @@ class Settings(BaseSettings):
             raise ValueError("Production requires a Redis REDIS_URL")
         if self.redis_require_tls and not self.redis_url.startswith("rediss://"):
             raise ValueError("Production Redis requires TLS via rediss://")
+        if self.auth_mode != "oidc":
+            raise ValueError("Production requires OIDC authentication")
+        if len(self.session_secret) < 32:
+            raise ValueError("Production session secret must be at least 32 characters")
+        if not self.session_https_only:
+            raise ValueError("Production requires secure session cookies")
+        if not self.oidc_client_id or not self.oidc_client_secret:
+            raise ValueError("Production requires OIDC client credentials")
+        if not self.oidc_metadata_url.startswith("https://"):
+            raise ValueError("Production OIDC metadata URL must use HTTPS")
         return self
 
 
